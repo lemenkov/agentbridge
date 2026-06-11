@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentbridge"
+version = "0.1.0"
+description = "Multi-agent orchestration bridge connecting AI agents via message bus"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Peter Lemenkov", email = "lemenkov@gmail.com" }]
+dependencies = [
+    "aio-pika>=9.0.0",
+]
+
+[project.optional-dependencies]
+systemd = ["systemd-python"]
+
+[project.scripts]
+agentbridge = "agentbridge.bridge:main"
+
+[project.urls]
+Homepage = "https://github.com/lemenkov/agentbridge"
+Repository = "https://github.com/lemenkov/agentbridge"
+Issues = "https://github.com/lemenkov/agentbridge/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentbridge"]
