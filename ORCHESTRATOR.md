@@ -157,6 +157,41 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
   Up* for how to resolve `$AMQP_URL`). The bridge has no default and refuses to
   start without it; the `:?` guard above aborts even earlier if it is unset.
 
+## Agent Images
+
+The spawn recipe above uses the stock `registry.fedoraproject.org/fedora:latest`
+image — enough for `claude` itself, which is mounted, not installed. When a
+task needs real tooling (NumPy, R, pandoc, LaTeX, compilers, …), do **not**
+`dnf install` it at spawn time: that is slow on every spawn, non-reproducible
+(it depends on what the repos serve that minute), and thrown away with `--rm`.
+Treat per-spawn `dnf install` only as a rare escape hatch for a genuine one-off.
+
+Instead, bake a purpose-built image once and select it per role or task class:
+
+```dockerfile
+# images/datasci.Containerfile
+FROM registry.fedoraproject.org/fedora:latest
+RUN dnf install -y python3-numpy python3-pandas R && dnf clean all
+```
+
+```bash
+podman build -t agentbridge-datasci -f images/datasci.Containerfile .
+```
+
+Then spawn with `agentbridge-datasci` in place of
+`registry.fedoraproject.org/fedora:latest`.
+
+**Keep `claude` mounted; bake only the toolchain.** The image carries tools;
+the bind mounts carry `claude`, its credentials, and the project. So images
+never need rebuilding when `claude` updates, and the toolchain cannot drift
+mid-task.
+
+**Promotion rule.** If you find yourself `dnf install`-ing the same package at
+spawn twice, bake it into an image instead.
+
+**Not a fit:** GUI / "design" software. An unattended bus agent is headless —
+no display, no GPU, no license server. Stick to CLI and compute tooling.
+
 ## Routing Keys
 
 | Purpose | Routing key |
