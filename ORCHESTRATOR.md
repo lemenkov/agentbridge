@@ -103,7 +103,7 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
         --log-opt tag="agentbridge-{role}-{id}" \
         -e IS_SANDBOX=1 \
         -v ~/.local/share/claude:/root/.local/share/claude:ro \
-        -v ~/.claude:/root/.claude:ro \
+        -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
         -v ~/.claude.json:/root/.claude.json:ro \
         -v /path/to/{project}:/workspace/{project}:rw \
         registry.fedoraproject.org/fedora:latest \
@@ -117,7 +117,10 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
 - `~/.local/share/claude` — the `claude` binary (read-only). It is a native
   binary under `versions/<VER>`; invoke the resolved absolute path (it is not
   on `PATH` inside the container)
-- `~/.claude` — Claude credentials and remote MCP connector auth (read-only)
+- `~/.claude/.credentials.json` — only the auth token (read-only). Do **not**
+  mount the whole `~/.claude`: that would expose every project's history and
+  memory, and the agent needs none of it. The rest of `/root/.claude` is the
+  container's own writable scratch, discarded with `--rm`.
 - `~/.claude.json` — Claude CLI config, including MCP servers (read-only)
 - `/path/to/{project}` — only the specific project being worked on
   (read-write); omit entirely for read-only tasks that touch no project files
@@ -175,6 +178,20 @@ of:
 - **Escalation** — notify the human if you are unsure how to proceed
 
 Do not leave agents waiting indefinitely.
+
+## Persisting Findings
+
+Agents persist nothing to disk except files inside their own project mount.
+Their durable output is whatever they publish to the bus (`[RESULT]` /
+`[SUMMARY]` on `{agent}.output`). **You are the curator.** As findings arrive,
+you decide what is worth keeping and persist it yourself — to your own memory,
+or to the project repo — and let the rest go.
+
+Do not give agents write access to `~/.claude` to "let them take notes": their
+memory is the bus and your judgement is the filter. An unattended,
+`--dangerously-skip-permissions` agent with write access to your Claude state
+could corrupt other projects' memory, and anything it wrote there would be
+silently loaded into your future sessions.
 
 ## Approval Policy
 
