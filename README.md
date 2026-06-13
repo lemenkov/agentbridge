@@ -109,6 +109,10 @@ routing key: researcher-01.inbox    body: {"body": "<task text>"}
 - The wrapped command follows the bridge's own flags directly, takes **no
   prompt argument** (`claude --print` reads the task from stdin), and must not
   be preceded by a `--` separator.
+- `--work-queue NAME` (optional) makes the worker also consume a shared queue.
+  Start several workers with the same `--work-queue` and the broker
+  load-balances tasks published to that routing key across them (a worker pool /
+  competing consumers); the per-agent inbox still receives directed messages.
 - `--outbox` defaults to `{agent_id}.output`. An idle worker is announced on
   `{agent_id}.waiting` after `--idle-timeout` seconds (default 60). Retire it
   with a `{"type": "shutdown"}` message to its inbox.

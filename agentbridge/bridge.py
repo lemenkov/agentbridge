@@ -34,6 +34,7 @@ async def bridge(
     amqp_url: str,
     exchange: str,
     inbox_topic: str,
+    work_topic: str | None,
     outbox_topic: str | None,
     idle_timeout: float,
     preamble: str,
@@ -53,11 +54,25 @@ async def bridge(
         durable=True,
     )
 
-    # The worker consumes from its inbox queue, bound to its own routing key and
-    # the broadcast channel.
+    # The worker consumes from its own inbox queue (directed messages), bound to
+    # its routing key and the broadcast channel.
     inbox_queue = await channel.declare_queue(f"{agent_id}.inbox", durable=True)
     await inbox_queue.bind(exch, routing_key=inbox_topic)
     await inbox_queue.bind(exch, routing_key="*.broadcast")
+
+    # Queues are polled in order, so the directed inbox takes priority over the
+    # shared pool.
+    queues = [inbox_queue]
+
+    # Optionally also consume a shared work queue: every worker given the same
+    # --work-queue name declares the same durable queue, so the broker hands each
+    # task published to that routing key to exactly one of them (competing
+    # consumers / a worker pool). It is NOT bound to *.broadcast — a broadcast to
+    # a shared queue would reach only one worker.
+    if work_topic:
+        work_queue = await channel.declare_queue(work_topic, durable=True)
+        await work_queue.bind(exch, routing_key=work_topic)
+        queues.append(work_queue)
 
     outbox = outbox_topic or f"{agent_id}.output"
     waiting_key = f"{agent_id}.waiting"
@@ -65,6 +80,8 @@ async def bridge(
     logger = logging.getLogger(__name__)
     logger.info("Worker %s ready", agent_id)
     logger.info("Inbox: %s + *.broadcast", inbox_topic)
+    if work_topic:
+        logger.info("Work queue (shared pool): %s", work_topic)
     logger.info("Outbox: %s | Idle timeout: %ss", outbox, idle_timeout)
     logger.info("Agent command: %s", " ".join(command))
 
@@ -119,8 +136,13 @@ async def bridge(
 
     while not stop:
         # basic_get polling (not an async iterator): a timed-out iterator read
-        # corrupts aio_pika's queue iterator, so we poll instead.
-        message = await inbox_queue.get(fail=False)
+        # corrupts aio_pika's queue iterator, so we poll instead. Poll the inbox
+        # first (directed messages win), then the shared pool.
+        message = None
+        for queue in queues:
+            message = await queue.get(fail=False)
+            if message is not None:
+                break
         if message is None:
             if not idle_announced and (time.monotonic() - last_activity) > idle_timeout:
                 await publish(waiting_key, {
@@ -188,6 +210,15 @@ def main() -> None:
         help="Routing key for incoming task messages (e.g. researcher-a1b2.inbox)",
     )
     parser.add_argument(
+        "--work-queue",
+        default=None,
+        metavar="NAME",
+        help="Optional shared queue for a worker pool. Workers started with the "
+             "same --work-queue compete for tasks published to that routing key "
+             "(the broker load-balances). The per-agent --inbox still receives "
+             "directed messages.",
+    )
+    parser.add_argument(
         "--outbox",
         default=None,
         help="Routing key for outgoing messages (default: {agent_id}.output)",
@@ -243,6 +274,7 @@ def main() -> None:
         amqp_url=args.amqp_url,
         exchange=args.exchange,
         inbox_topic=args.inbox,
+        work_topic=args.work_queue,
         outbox_topic=args.outbox,
         idle_timeout=args.idle_timeout,
         preamble=preamble,

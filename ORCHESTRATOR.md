@@ -178,6 +178,36 @@ after finishing any task in flight.
   Up* for how to resolve `$AMQP_URL`). The bridge has no default and refuses to
   start without it; the `:?` guard above aborts even earlier if it is unset.
 
+## Worker Pools
+
+A single worker handles tasks one at a time. To process work in parallel, run
+several workers of the same role as a **pool** — give them all the same
+`--work-queue {role}.work` (distinct `--agent`/`--inbox` each):
+
+```bash
+for i in 1 2 3; do
+    nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
+        --agent research-$i --inbox research-$i.inbox \
+        --work-queue research.work \
+        --amqp-url "$AMQP_URL" --idle-timeout 45 \
+        --preamble-file "$AGENTBRIDGE_HOME"/AGENT.md \
+        --preamble-file "$AGENTBRIDGE_HOME"/SKILLS/researcher.md \
+        podman run ... &        # same podman block as the single-worker recipe
+done
+```
+
+Dispatch work to the **pool** by publishing tasks to routing key
+`research.work` instead of a specific inbox — the broker hands each task to one
+free worker (competing consumers) and load-balances across the pool with no
+orchestrator picking. You still address an individual worker through its
+`{agent}.inbox` (e.g. to retire just one with `{"type":"shutdown"}`).
+
+Because a task is ack'd only after its agent finishes, a worker that crashes
+mid-task leaves the task unacked and the broker **redelivers** it to another
+worker — no orchestrator bookkeeping. This is the structural routing the broker
+owns: *which* free worker runs the next task. Deciding *what* the task is and
+what to do with the result stays with you.
+
 ## Agent Images
 
 The spawn recipe above uses the stock `registry.fedoraproject.org/fedora:latest`
@@ -218,6 +248,7 @@ no display, no GPU, no license server. Stick to CLI and compute tooling.
 | Purpose | Routing key |
 |---|---|
 | Send task to specific agent | `{agent_id}.inbox` |
+| Dispatch task to a role pool | `{role}.work` |
 | Receive output from all agents | `*.output` |
 | Receive idle signals | `*.waiting` |
 | Broadcast to all agents | `orchestrator.broadcast` |
