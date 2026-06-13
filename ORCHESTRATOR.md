@@ -48,6 +48,21 @@ resolved URL fails to connect (authentication error, name-resolution failure,
 connection refused), discard it, tell the human it stopped working, ask for a
 current one, and update what you remember.
 
+## Committer identity
+
+Implementer agents sign off their commits, which needs a committer identity.
+Resolve it the same way as the bus URL, and **never fabricate one**:
+
+1. **System setting** — the host's git config (`~/.gitconfig`). Supply it to an
+   implementer by mounting it read-only (`-v ~/.gitconfig:/root/.gitconfig:ro`);
+   then `git commit -s` signs off as that identity automatically.
+2. **Verbal directive** — if the human gave you a name/email this session, pass
+   it to the agent in the task instead.
+3. **Neither available** → ask the human; do not guess.
+
+The placeholder used in examples is `Jon Doe <jdoe@example.com>` — substitute the
+real, resolved identity.
+
 ## Bridge venv (one-time setup)
 
 The host bridge runs from a venv at `$AGENTBRIDGE_HOME/venv`. Create or
@@ -268,6 +283,13 @@ mid-task.
 
 **Promotion rule.** If you find yourself `dnf install`-ing the same package at
 spawn twice, bake it into an image instead.
+
+**Implementer images need `git`.** Implementer agents branch, develop, and
+commit their own work (signed-off) on the project's read-write mount, so their
+image must include `git` alongside any build tools. The example C/C++ pool image
+is `agentbridge-cdev` (`fedora:latest` + `gcc gcc-c++ cmake make git`). Supply
+the committer identity (see *Committer identity*) and the agent commits with
+`-s`; it never pushes — leave the branch for review.
 
 **Not a fit:** GUI / "design" software. An unattended bus agent is headless —
 no display, no GPU, no license server. Stick to CLI and compute tooling.
