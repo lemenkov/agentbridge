@@ -65,6 +65,10 @@ venv/bin/pip install -e ".[systemd]"      # optional: journald logging
 
 Without the `systemd` extra the bridge logs to stderr instead of journald.
 
+This installs two console scripts: **`agentbridge`** (the per-agent worker
+bridge) and **`agentbus`** (the orchestrator's bus helper — `setup` the
+collector queue, `send` tasks/shutdowns, `collect` agent output).
+
 ## Running the orchestrator
 
 A human only ever starts the **orchestrator** — a plain `claude` session run

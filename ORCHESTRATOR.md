@@ -72,6 +72,33 @@ extra only if you want it — the bridge falls back to stderr logging otherwise:
 "$AGENTBRIDGE_HOME/venv/bin/pip" install -e "$AGENTBRIDGE_HOME[systemd]"
 ```
 
+## Talking to the bus (`agentbus`)
+
+You drive the bus with the `agentbus` helper, installed alongside `agentbridge`
+in the venv. It reads the broker URL from `$AMQP_URL` (or an explicit
+`--amqp-url`):
+
+```bash
+BUS="$AGENTBRIDGE_HOME/venv/bin/agentbus"
+
+# once, before launching workers, so their output is captured from the start:
+"$BUS" setup --purge
+
+# give a specific worker a task, or dispatch to a role pool:
+"$BUS" send --to research-1.inbox --body "Summarise /workspace/proj/x.md"
+"$BUS" send --to research.work    --body "..."
+
+# watch results (stops on idle, a wall-clock cap, or a marker substring):
+"$BUS" collect --idle 60 --until TASK_COMPLETE
+
+# retire a worker:
+"$BUS" send --to research-1.inbox --shutdown
+```
+
+`send` declares the destination queue before publishing, so a task is never lost
+if it races a worker's startup. `collect` consumes the shared
+`orchestrator.collect` queue (bound to `*.output` and `*.waiting`).
+
 ## Spawning an Agent
 
 The `agentbridge` process runs **on your host** as a persistent *pull-worker*:
@@ -119,11 +146,13 @@ and prepended to each task, so it never needs mounting into the container.
 
 ### 2. Send the worker tasks
 
-The worker sits idle until you publish work to its inbox. Each task is a JSON
-message `{"body": "<task text>"}` on routing key `{role}-{id}.inbox`. The bridge
-prepends the preamble, feeds `preamble + task` to a fresh `claude --print`, and
-the agent's output comes back on `{role}-{id}.output`. Send as many tasks as you
-like — the worker handles them one at a time, in order.
+The worker sits idle until you publish work to its inbox — use
+`agentbus send --to {role}-{id}.inbox --body "<task>"` (see *Talking to the
+bus*). Each task is a JSON message `{"body": "<task text>"}` on routing key
+`{role}-{id}.inbox`. The bridge prepends the preamble, feeds `preamble + task` to
+a fresh `claude --print`, and the agent's output comes back on
+`{role}-{id}.output`. Send as many tasks as you like — the worker handles them
+one at a time, in order.
 
 Because the agent is stateless between tasks, **include any context it needs in
 each task** (it does not remember the previous one). Retire the worker with a
@@ -260,8 +289,8 @@ When you receive a `*.waiting` message, an agent has gone idle and is waiting
 for instructions. You must respond by publishing to `{agent_id}.inbox` with one
 of:
 
-- **Next task** — publish `{"body": "<task text>"}` to its inbox
-- **Completion** — publish `{"type": "shutdown"}` to its inbox; the worker
+- **Next task** — `agentbus send --to {agent_id}.inbox --body "<task text>"`
+- **Completion** — `agentbus send --to {agent_id}.inbox --shutdown`; the worker
   finishes any task in flight, then exits cleanly
 - **Escalation** — notify the human if you are unsure how to proceed
 

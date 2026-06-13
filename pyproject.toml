@@ -22,6 +22,7 @@ systemd = ["systemd-python"]
 
 [project.scripts]
 agentbridge = "agentbridge.bridge:main"
+agentbus = "agentbridge.bus:main"
 
 [project.urls]
 Homepage = "https://github.com/lemenkov/agentbridge"
