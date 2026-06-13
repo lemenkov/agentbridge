@@ -1,7 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""stdio↔RabbitMQ bridge for AI agent orchestration."""
+"""stdio↔RabbitMQ bridge / pull-worker for AI agent orchestration.
+
+Runs on the host as a long-lived *pull-worker*: it consumes task messages from
+a RabbitMQ queue and, for each one, spawns the wrapped agent command fresh,
+feeds the task to its stdin, and republishes the agent's stdout to the bus. The
+agent process (e.g. ``claude --print``) is stateless and disposable — the
+worker (this bridge) is what persists and pulls the next task.
+
+A task is acknowledged only after the agent process exits, so a worker that
+crashes mid-task leaves the task unacked and the broker redelivers it.
+"""
 
 import argparse
 import asyncio
@@ -26,138 +36,130 @@ async def bridge(
     inbox_topic: str,
     outbox_topic: str | None,
     idle_timeout: float,
+    preamble: str,
     command: list[str],
 ) -> None:
-    """Run the stdio↔RabbitMQ bridge."""
+    """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
-    # Connect to RabbitMQ
     connection = await aio_pika.connect_robust(amqp_url)
     channel = await connection.channel()
+    # Pull one task at a time; this is also what makes a pool of workers sharing
+    # one queue load-balance fairly (competing consumers).
+    await channel.set_qos(prefetch_count=1)
 
-    # Declare exchange (topic type for flexible routing)
     exch = await channel.declare_exchange(
         exchange,
         aio_pika.ExchangeType.TOPIC,
         durable=True,
     )
 
-    # Declare inbox queue — agent receives messages here
-    # Binds to both its specific inbox and the broadcast channel
-    inbox_queue = await channel.declare_queue(
-        f"{agent_id}.inbox",
-        durable=True,
-    )
+    # The worker consumes from its inbox queue, bound to its own routing key and
+    # the broadcast channel.
+    inbox_queue = await channel.declare_queue(f"{agent_id}.inbox", durable=True)
     await inbox_queue.bind(exch, routing_key=inbox_topic)
     await inbox_queue.bind(exch, routing_key="*.broadcast")
 
-    # Default outbox routing key follows {agent_id}.{message_type} convention
-    effective_outbox = outbox_topic or f"{agent_id}.output"
-
-    # Spawn the subprocess capturing all streams
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,  # capture to detect thinking activity
-    )
+    outbox = outbox_topic or f"{agent_id}.output"
+    waiting_key = f"{agent_id}.waiting"
 
     logger = logging.getLogger(__name__)
-    logger.info("Agent %s started (pid=%d)", agent_id, proc.pid)
+    logger.info("Worker %s ready", agent_id)
     logger.info("Inbox: %s + *.broadcast", inbox_topic)
-    logger.info("Outbox: %s", effective_outbox)
-    logger.info("Idle timeout: %ss", idle_timeout)
+    logger.info("Outbox: %s | Idle timeout: %ss", outbox, idle_timeout)
+    logger.info("Agent command: %s", " ".join(command))
 
-    # Shared activity timestamps
-    last_activity: dict[str, float] = {
-        "stdout": time.monotonic(),
-        "stderr": time.monotonic(),
-    }
-    waiting_for_orchestrator = asyncio.Event()
+    async def publish(routing_key: str, obj: dict) -> None:
+        await exch.publish(
+            aio_pika.Message(
+                body=json.dumps(obj).encode(),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
+            routing_key=routing_key,
+        )
 
-    async def stdout_to_rabbit() -> None:
-        """Read subprocess stdout, publish to RabbitMQ."""
-        async for line in proc.stdout:
-            text = line.decode().rstrip()
-            if not text:
-                continue
-            last_activity["stdout"] = time.monotonic()
-            msg = json.dumps({
-                "agent_id": agent_id,
-                "routing_key": effective_outbox,
-                "type": "output",
-                "body": text,
-            })
-            await exch.publish(
-                aio_pika.Message(
-                    body=msg.encode(),
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                ),
-                routing_key=effective_outbox,
-            )
-            logger.info("→ %s: %s", effective_outbox, text[:80])
+    async def run_task(task_text: str) -> int:
+        """Spawn the agent fresh, feed it the task on stdin, republish stdout."""
+        payload = f"{preamble}\n\nYour task: {task_text}" if preamble else task_text
 
-    async def stderr_monitor() -> None:
-        """Monitor stderr for activity — Claude CLI shows animation while thinking."""
-        async for line in proc.stderr:
-            last_activity["stderr"] = time.monotonic()
-            # Forward to real stderr so humans can observe
-            sys.stderr.write(line.decode())
-            sys.stderr.flush()
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        proc.stdin.write(payload.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()  # EOF so the agent starts processing the prompt
 
-    async def idle_detector() -> None:
-        """Detect when agent is genuinely idle (both stdout and stderr silent)."""
-        while proc.returncode is None:
-            await asyncio.sleep(5.0)  # check interval
-            now = time.monotonic()
-            stdout_idle = now - last_activity["stdout"] > idle_timeout
-            stderr_idle = now - last_activity["stderr"] > idle_timeout
+        async def pump_stdout() -> None:
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if not text:
+                    continue
+                await publish(outbox, {
+                    "agent_id": agent_id,
+                    "routing_key": outbox,
+                    "type": "output",
+                    "body": text,
+                })
+                logger.info("→ %s: %s", outbox, text[:80])
 
-            if stdout_idle and stderr_idle and not waiting_for_orchestrator.is_set():
-                waiting_for_orchestrator.set()
-                logger.info("Agent %s idle — notifying orchestrator", agent_id)
-                await exch.publish(
-                    aio_pika.Message(
-                        body=json.dumps({
-                            "agent_id": agent_id,
-                            "type": "waiting_for_input",
-                            "body": f"Agent {agent_id} is idle and waiting for instructions",
-                        }).encode(),
-                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                    ),
-                    routing_key=f"{agent_id}.waiting",
-                )
+        async def pump_stderr() -> None:
+            async for line in proc.stderr:
+                # Forward to real stderr so humans/journald can observe.
+                sys.stderr.write(line.decode(errors="replace"))
+                sys.stderr.flush()
 
-    async def rabbit_to_stdin() -> None:
-        """Consume RabbitMQ inbox, write to subprocess stdin."""
-        async with inbox_queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                async with message.process():
-                    payload = json.loads(message.body.decode())
-                    text = payload.get("body", "")
-                    proc.stdin.write((text + "\n").encode())
-                    await proc.stdin.drain()
-                    # Reset activity timestamps and clear waiting flag
-                    last_activity["stdout"] = time.monotonic()
-                    last_activity["stderr"] = time.monotonic()
-                    waiting_for_orchestrator.clear()
-                    logger.info("← %s: %s", message.routing_key, text[:80])
+        await asyncio.gather(pump_stdout(), pump_stderr())
+        return await proc.wait()
 
-    # Run all coroutines concurrently
-    await asyncio.gather(
-        stdout_to_rabbit(),
-        stderr_monitor(),
-        idle_detector(),
-        rabbit_to_stdin(),
-        proc.wait(),
-    )
+    last_activity = time.monotonic()
+    idle_announced = False
+    stop = False
 
-    logger.info("Agent %s exited", agent_id)
+    while not stop:
+        # basic_get polling (not an async iterator): a timed-out iterator read
+        # corrupts aio_pika's queue iterator, so we poll instead.
+        message = await inbox_queue.get(fail=False)
+        if message is None:
+            if not idle_announced and (time.monotonic() - last_activity) > idle_timeout:
+                await publish(waiting_key, {
+                    "agent_id": agent_id,
+                    "type": "waiting_for_input",
+                    "body": f"Agent {agent_id} is idle and waiting for instructions",
+                })
+                logger.info("Agent %s idle — announced on %s", agent_id, waiting_key)
+                idle_announced = True
+            await asyncio.sleep(1.0)
+            continue
+
+        # Ack only after the task completes: msg.process() acks on clean exit and
+        # rejects on exception, and a worker crash leaves it unacked → redelivered.
+        async with message.process():
+            try:
+                payload = json.loads(message.body.decode())
+            except json.JSONDecodeError:
+                payload = {"body": message.body.decode(errors="replace")}
+
+            if payload.get("type") == "shutdown":
+                logger.info("Shutdown requested — retiring worker %s", agent_id)
+                stop = True
+            else:
+                task = payload.get("body", "")
+                logger.info("← task: %s", task[:80])
+                rc = await run_task(task)
+                logger.info("Task complete (rc=%d)", rc)
+
+        last_activity = time.monotonic()
+        idle_announced = False
+
     await connection.close()
+    logger.info("Worker %s exited", agent_id)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="stdio↔RabbitMQ bridge for AI agent orchestration"
+        description="stdio↔RabbitMQ bridge / pull-worker for AI agent orchestration"
     )
     parser.add_argument(
         "--agent",
@@ -183,7 +185,7 @@ def main() -> None:
     parser.add_argument(
         "--inbox",
         required=True,
-        help="Routing key for incoming messages (e.g. researcher-a1b2.inbox)",
+        help="Routing key for incoming task messages (e.g. researcher-a1b2.inbox)",
     )
     parser.add_argument(
         "--outbox",
@@ -194,17 +196,27 @@ def main() -> None:
         "--idle-timeout",
         type=float,
         default=60.0,
-        help="Seconds of silence before notifying orchestrator (default: 60)",
+        help="Seconds with no task before announcing idle (default: 60)",
+    )
+    parser.add_argument(
+        "--preamble-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="File prepended to every task as the agent's role preamble "
+             "(repeatable; concatenated in order). Read host-side, so it never "
+             "needs to be mounted into the agent's sandbox.",
     )
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="Command to wrap (e.g. claude)",
+        help="Agent command to spawn per task (e.g. claude --print). The task is "
+             "fed to its stdin; its stdout is republished to the bus.",
     )
     args = parser.parse_args()
 
     if not args.command:
-        parser.error("No command specified — provide a command to wrap after --")
+        parser.error("No command specified — provide a command to wrap after the options")
 
     agent_id = args.agent or generate_agent_id(args.agent_prefix)
 
@@ -220,7 +232,11 @@ def main() -> None:
 
     logging.basicConfig(handlers=[handler], level=logging.INFO)
     logger = logging.getLogger(__name__)
-    logger.info("Starting agent: %s", agent_id)
+    logger.info("Starting worker: %s", agent_id)
+
+    preamble = "\n\n".join(
+        open(path, encoding="utf-8").read() for path in args.preamble_file
+    )
 
     asyncio.run(bridge(
         agent_id=agent_id,
@@ -229,6 +245,7 @@ def main() -> None:
         inbox_topic=args.inbox,
         outbox_topic=args.outbox,
         idle_timeout=args.idle_timeout,
+        preamble=preamble,
         command=args.command,
     ))
 

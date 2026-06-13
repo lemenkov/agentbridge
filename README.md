@@ -9,11 +9,12 @@ Multi-agent orchestration bridge connecting AI agents via a message bus.
 
 ## Overview
 
-`agentbridge` wraps any stdio-based AI agent (e.g. the `claude` CLI) and
-connects it to a RabbitMQ topic exchange: messages published to the agent's
-inbox are written to its stdin, and everything the agent writes to stdout is
-published to its outbox. An orchestrator can then coordinate many agents
-asynchronously over the bus, with the agents fully decoupled from one another.
+`agentbridge` wraps a stdio-based AI agent (e.g. the `claude` CLI) and turns it
+into a RabbitMQ **pull-worker**: it consumes task messages from the agent's
+inbox queue and, for each one, runs the agent fresh with that task on stdin and
+republishes the agent's stdout to the bus. The agent runs once per task and
+exits — it is stateless and disposable; the bridge persists and pulls the next.
+An orchestrator coordinates many such workers asynchronously over the bus.
 
 ## Architecture
 
@@ -91,15 +92,26 @@ agentbridge \
     --agent researcher-01 \
     --inbox researcher-01.inbox \
     --amqp-url amqp://agentbridge:YOURPASSWORD@rabbitmq.host/ \
-    claude --dangerously-skip-permissions --print "Your task here"
+    --preamble-file AGENT.md --preamble-file SKILLS/researcher.md \
+    claude --print --dangerously-skip-permissions
+```
+
+The wrapped command carries **no task** — the worker feeds each task to the
+agent's stdin as it arrives. To give it work, publish a task to its inbox:
+
+```
+routing key: researcher-01.inbox    body: {"body": "<task text>"}
 ```
 
 - `--amqp-url` is **required** — the bridge refuses to start without it.
-- The wrapped command follows the bridge's own flags directly. Do **not** place
-  a `--` separator before it; the trailing argv is passed through verbatim.
-- `--outbox` defaults to `{agent_id}.output`. An idle agent is announced on
-  `{agent_id}.waiting` after `--idle-timeout` seconds (default 60), so the
-  orchestrator can send it the next instruction.
+- `--preamble-file` (repeatable) is prepended to every task as the agent's role
+  context; it is read host-side, so it needn't be mounted into a sandbox.
+- The wrapped command follows the bridge's own flags directly, takes **no
+  prompt argument** (`claude --print` reads the task from stdin), and must not
+  be preceded by a `--` separator.
+- `--outbox` defaults to `{agent_id}.output`. An idle worker is announced on
+  `{agent_id}.waiting` after `--idle-timeout` seconds (default 60). Retire it
+  with a `{"type": "shutdown"}` message to its inbox.
 
 ## Requirements
 

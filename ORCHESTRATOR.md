@@ -74,26 +74,29 @@ extra only if you want it — the bridge falls back to stderr logging otherwise:
 
 ## Spawning an Agent
 
-The `agentbridge` process runs **on your host** — it is the only thing that
-talks to the message bus, and it uses the project venv's Python dependencies.
-It wraps a `podman run` subprocess that launches `claude` inside an isolated
-container on the stock Fedora image. The container needs nothing but the
-`claude` binary and its credentials — no Python, no `agentbridge`, no broker
-access. Run the bridge in the background and capture its log:
+The `agentbridge` process runs **on your host** as a persistent *pull-worker*:
+you launch it once per agent, and it then consumes task messages from its inbox
+and, for each one, spawns a fresh `claude` inside an isolated container — the
+task fed to its stdin, the role preamble prepended host-side — republishing the
+agent's stdout to the bus. The agent is **stateless and disposable**; the worker
+(the bridge) is what persists and pulls the next task. The container needs
+nothing but the `claude` binary and its credentials — no Python, no
+`agentbridge`, no broker access.
+
+### 1. Launch the worker (once per agent)
 
 ```bash
 AGENTBRIDGE_HOME=/path/to/agentbridge   # this repo's checkout
 : "${AMQP_URL:?set AMQP_URL to the human-provided bus URL before spawning}"
 CLAUDE_VER=$(basename "$(readlink -f ~/.local/bin/claude)")
-PROMPT="$(cat "$AGENTBRIDGE_HOME"/AGENT.md "$AGENTBRIDGE_HOME"/SKILLS/{role}.md)
-
-Your task: {task}"
 
 nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
     --agent {role}-{id} \
     --inbox {role}-{id}.inbox \
     --amqp-url "$AMQP_URL" \
     --idle-timeout 45 \
+    --preamble-file "$AGENTBRIDGE_HOME"/AGENT.md \
+    --preamble-file "$AGENTBRIDGE_HOME"/SKILLS/{role}.md \
     podman run \
         --rm \
         --interactive \
@@ -107,11 +110,25 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
         -v ~/.claude.json:/root/.claude.json:ro \
         -v /path/to/{project}:/workspace/{project}:rw \
         registry.fedoraproject.org/fedora:latest \
-        "/root/.local/share/claude/versions/${CLAUDE_VER}" \
-            --dangerously-skip-permissions \
-            --print "$PROMPT" \
+        "/root/.local/share/claude/versions/${CLAUDE_VER}" --print --dangerously-skip-permissions \
     > ~/.cache/agentbridge-{role}-{id}.log 2>&1 &
 ```
+
+The preamble (AGENT.md + the role skill) is read **host-side** by the bridge
+and prepended to each task, so it never needs mounting into the container.
+
+### 2. Send the worker tasks
+
+The worker sits idle until you publish work to its inbox. Each task is a JSON
+message `{"body": "<task text>"}` on routing key `{role}-{id}.inbox`. The bridge
+prepends the preamble, feeds `preamble + task` to a fresh `claude --print`, and
+the agent's output comes back on `{role}-{id}.output`. Send as many tasks as you
+like — the worker handles them one at a time, in order.
+
+Because the agent is stateless between tasks, **include any context it needs in
+each task** (it does not remember the previous one). Retire the worker with a
+control message — `{"type": "shutdown"}` to its inbox — and it exits cleanly
+after finishing any task in flight.
 
 **Filesystem mounts — be explicit and minimal:**
 - `~/.local/share/claude` — the `claude` binary (read-only). It is a native
@@ -130,8 +147,11 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
 - The bridge runs on the host from the venv (`$AGENTBRIDGE_HOME/venv`), whose
   console-script shebang and dependencies are only valid on the host. Only
   `claude` runs in the container.
-- The prompt is assembled **on the host** (host paths to `AGENT.md` and the
-  role skill) and passed as a single `--print` argument.
+- The role preamble is read **host-side** via `--preamble-file` (repeatable,
+  concatenated) and prepended to each task — so `AGENT.md`/skills never need to
+  be mounted into the container. The task body arrives over the bus.
+- `claude --print` reads its prompt from **stdin** (note: no prompt argument).
+  The bridge writes `preamble + task` to stdin and closes it so claude starts.
 - **Do not put a `--` before `podman`.** The bridge passes its trailing argv
   straight to the wrapped command; a leading `--` would be exec'd literally and
   fail with `FileNotFoundError: '--'`.
@@ -142,7 +162,8 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
   bind-mounted `claude` binary (`exec: Permission denied`).
 - `-e IS_SANDBOX=1` is required: `claude` refuses `--dangerously-skip-permissions`
   as container root without it. The container is the sandbox.
-- `--interactive` keeps stdin open so the bridge can deliver follow-up tasks.
+- `--interactive` keeps stdin open so the bridge can pipe each task into the
+  container's `claude`.
 - `--dangerously-skip-permissions` is intentional — agents are unattended and
   must not block on permission prompts. The permission layer is you and the
   human, not Claude's built-in prompts.
@@ -150,9 +171,9 @@ nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
   mounted `~/.claude` credentials and `~/.claude.json` config.
 - Monitor the container: `journalctl CONTAINER_TAG=agentbridge-{role}-{id} -f`.
   Monitor the bridge: its redirected log (`~/.cache/agentbridge-{role}-{id}.log`).
-- In `--print` mode `claude` exits when the task is done, but the bridge keeps
-  running on its inbox listener — kill the host bridge process to retire a
-  finished agent.
+- Each task spawns a **fresh container** (cold `podman run` + claude start, a
+  second or two of overhead); the worker bridge persists across tasks. Retire it
+  with a `{"type":"shutdown"}` message, or kill the host bridge process.
 - The bus URL is passed explicitly via `--amqp-url "$AMQP_URL"` (see *Starting
   Up* for how to resolve `$AMQP_URL`). The bridge has no default and refuses to
   start without it; the `:?` guard above aborts even earlier if it is unset.
@@ -208,8 +229,9 @@ When you receive a `*.waiting` message, an agent has gone idle and is waiting
 for instructions. You must respond by publishing to `{agent_id}.inbox` with one
 of:
 
-- **Next task** — continue with a new instruction
-- **Completion** — `{"body": "Your work is complete. Exit."}` to terminate
+- **Next task** — publish `{"body": "<task text>"}` to its inbox
+- **Completion** — publish `{"type": "shutdown"}` to its inbox; the worker
+  finishes any task in flight, then exits cleanly
 - **Escalation** — notify the human if you are unsure how to proceed
 
 Do not leave agents waiting indefinitely.
