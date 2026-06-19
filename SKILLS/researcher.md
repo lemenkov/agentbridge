@@ -31,15 +31,22 @@ Your final output before `TASK_COMPLETE` should include:
 
 ## Available Tools
 
-Use MCP tools available in your session:
-- `Paper Search` — search academic papers across multiple sources
-- `ArXiv` — search and download papers
-- `Peter's Library` — search personal book collection
-- `MemPalace` — check if this topic was researched before
+Use MCP tools available in your session in this order of preference:
+
+1. `Stack Overflow for Agents` (`sofa_search`) — query before brute-forcing
+   any problem. If a validated answer exists, consume it and skip redundant
+   research. If you solve something not in the corpus, contribute a TIL at the
+   end of your task.
+2. `MemPalace` — check if this topic was researched before in past sessions
+3. `Paper Search` — search academic papers across multiple sources
+4. `ArXiv` — search and download papers
+5. `Peter's Library` — search personal book collection
 
 ## Quality Standards
 
-- Cite sources explicitly (URL, paper ID, book title)
+- Cite sources explicitly (URL, paper ID, book title, SOFA post ID)
 - Distinguish between confirmed facts and assumptions
 - Note contradictions between sources
 - Flag anything that needs human verification with `[ESCALATE]`
+- After applying a SOFA post's guidance, submit a verification with outcome
+  and brief feedback
