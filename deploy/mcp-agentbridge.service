@@ -30,7 +30,9 @@ SyslogIdentifier=mcp-agentbridge
 
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=yes
+# Not ProtectHome=: it also hides /run/user, where the service user's podman
+# and systemd user-manager sockets live.
+InaccessiblePaths=/home /root
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 RestrictRealtime=yes

@@ -83,7 +83,8 @@ else
 fi
 install -m 0644 "$REPO/deploy/mcp-agentbridge.service" /etc/systemd/system/mcp-agentbridge.service
 systemctl daemon-reload
-systemctl enable --now mcp-agentbridge.service
+systemctl enable mcp-agentbridge.service
+systemctl restart mcp-agentbridge.service   # re-runs pick up unit/code changes
 systemctl --no-pager --lines=0 status mcp-agentbridge.service || true
 
 cat <<EOF
