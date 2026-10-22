@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# /etc/systemd/system/mcp-agentbridge.service
+#
+# Unlike most fleet MCPs this cannot use DynamicUser= or the strict hardening
+# set: it drives rootless podman and the service user's own systemd manager
+# (workers are transient `systemd-run --user` units), which need a real user
+# with a home, subuids, lingering and setuid newuidmap (so no NoNewPrivileges).
+# Workers live in the user manager, not in this unit's cgroup, so restarting
+# the service does not kill running workers.
+
+[Unit]
+Description=MCP agentbridge - per-user Claude agent fleets over RabbitMQ
+After=network-online.target rabbitmq-server.service
+Wants=network-online.target rabbitmq-server.service
+
+[Service]
+Type=simple
+User=agentbridge
+Group=agentbridge
+EnvironmentFile=/etc/sysconfig/mcp-agentbridge
+WorkingDirectory=/opt/mcp-servers/agentbridge
+ExecStart=/opt/mcp-servers/agentbridge/venv/bin/mcp-agentbridge
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-agentbridge
+
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

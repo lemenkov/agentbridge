@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# /etc/sysconfig/mcp-agentbridge — read by the service and by agentbridge-admin.
+
+HOST=127.0.0.1
+PORT=8817
+MCP_TRANSPORT=streamable-http
+
+# Identity comes only from this header, which nginx sets from the Basic-auth
+# user (and overwrites any client-supplied value).
+USER_HEADER=x-forwarded-user
+
+SERVICE_USER=agentbridge
+TENANTS_DIR=/var/lib/mcp-agentbridge/tenants
+WORKSPACES_DIR=/srv/agentbridge
+AGENTBRIDGE_HOME=/opt/mcp-servers/agentbridge
+
+AMQP_HOST=localhost:5672
+AGENTBRIDGE_EXCHANGE=agents
+
+# Native claude binary, bind-mounted read-only into every leaf container.
+# deploy/setup-host.sh installs it here; re-run it to update claude.
+CLAUDE_BIN=/usr/local/libexec/agentbridge/claude
+
+# Generic per-worker caps, enforced by systemd on each worker unit (containers
+# run inside it). The per-user worker count is set at provisioning time.
+WORKER_MEMORY_MAX=3G
+WORKER_CPU_QUOTA=200%
+WORKER_TASKS_MAX=512
+WORKER_IDLE_TIMEOUT=45
+DEFAULT_MAX_WORKERS=4
+
+MAX_COLLECT_SECONDS=120
+INLINE_MAX_BYTES=4096
+WORKSPACE_READ_MAX=262144
+CLONE_TIMEOUT=300

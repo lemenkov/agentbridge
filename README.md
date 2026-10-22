@@ -130,6 +130,40 @@ routing key: researcher-01.inbox    body: {"body": "<task text>"}
   outbox. A task may carry a `"task_id"`, which is echoed on its output and
   done messages (`agentbus send` adds one automatically).
 
+## MCP service (`mcp-agentbridge`)
+
+The same fleet can be driven over MCP by any number of users, each from the
+Claude they already use (claude.ai or Claude Code). `mcp-agentbridge` runs as
+one service behind nginx and scopes every tool call to the caller named by
+nginx's `X-Forwarded-User` (the Basic-auth user):
+
+| Per user `<u>` | |
+|---|---|
+| Bus | RabbitMQ vhost `ab-<u>`, bus user `ab-<u>` permitted only there |
+| Credential | podman secret `anthropic-<u>-apikey` (or `-oauth`), injected into that user's containers only |
+| Workspace | `/srv/agentbridge/<u>/`, mounted at `/workspace` (ro or rw by role) |
+| Workers | transient systemd user units `agentbridge-<u>-<role>-<n>`, capped by `MemoryMax`/`CPUQuota`/`TasksMax` |
+
+Tools: `whoami`, `list_roles`, `spawn_worker`, `list_workers`, `send_task`,
+`broadcast`, `collect`, `retire_worker`, `retire_all`, `workspace_ls`,
+`workspace_read`, `workspace_write`, `clone_repo`. Roles, images and mounts are
+server-side allowlists; no tool argument is a host path, image or flag. Leaves
+use rootless default networking (no `--network=host`), so they cannot reach
+host loopback services.
+
+```bash
+pip install -e ".[systemd,mcp]"                 # into this repo's venv
+sudo deploy/setup-host.sh                       # service user, images, unit
+sudo venv/bin/agentbridge-admin provision <u> --git-name "..." --git-email "..."
+```
+
+`setup-host.sh` prints the remaining manual steps: the nginx location
+(`deploy/nginx-location.conf`), binding RabbitMQ to loopback, and registering
+each user's Anthropic credential out of band. That credential is the only
+secret a user hands over; it sits in a 0600 store on a host the operator is
+root on, so users should register a dedicated, spend-capped key and watch
+their own usage.
+
 ## Requirements
 
 - Python 3.10+

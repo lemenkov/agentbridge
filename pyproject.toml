@@ -19,10 +19,13 @@ dependencies = [
 
 [project.optional-dependencies]
 systemd = ["systemd-python"]
+mcp = ["fastmcp>=3.0.0,<4"]
 
 [project.scripts]
 agentbridge = "agentbridge.bridge:main"
 agentbus = "agentbridge.bus:main"
+mcp-agentbridge = "agentbridge.service.server:main"
+agentbridge-admin = "agentbridge.service.admin:main"
 
 [project.urls]
 Homepage = "https://github.com/lemenkov/agentbridge"
