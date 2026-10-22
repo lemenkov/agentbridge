@@ -7,7 +7,8 @@
 #   sudo deploy/setup-host.sh [path-to-claude-binary]
 #
 # Re-run it to update the claude binary the leaves use. The claude source
-# defaults to the invoking user's native install (~/.local/bin/claude).
+# defaults to the native install (~/.local/bin/claude) of the sudo user, or of
+# the repo's owner when run as root directly.
 # It does NOT touch nginx, RabbitMQ's listener config, or any tenant — those
 # steps are printed at the end.
 
@@ -15,7 +16,9 @@ set -euo pipefail
 
 SVC=agentbridge
 SVC_HOME=/var/lib/mcp-agentbridge
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+# Physical path: the service user must be able to reach it, and a symlinked
+# path through a 0700 home directory would not be.
+REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 LIBEXEC=/usr/local/libexec/agentbridge
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
@@ -55,8 +58,9 @@ install -d -m 0750 -o "$SVC" -g "$SVC" /srv/agentbridge
 
 # --- claude binary, mounted read-only into leaves -----------------------------
 SRC=${1:-}
-if [[ -z $SRC && -n ${SUDO_USER:-} ]]; then
-    SRC=$(readlink -f "$(getent passwd "$SUDO_USER" | cut -d: -f6)/.local/bin/claude" || true)
+if [[ -z $SRC ]]; then
+    owner=${SUDO_USER:-$(stat -c %U "$REPO")}
+    SRC=$(readlink -f "$(getent passwd "$owner" | cut -d: -f6)/.local/bin/claude" || true)
 fi
 if [[ -n $SRC && -x $SRC ]]; then
     install -d -m 0755 "$LIBEXEC"
