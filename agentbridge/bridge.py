@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -50,6 +51,41 @@ def resolve_amqp_url(
     )
 
 
+# Per-task agent options, appended to the wrapped command as `--model X` /
+# `--effort Y` (claude's flags). Values are allowlisted: a task sender must not
+# be able to inject arbitrary arguments.
+MODEL_RE = re.compile(r"^(fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,63})$")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def validate_task_options(model: str | None, effort: str | None) -> dict[str, str]:
+    """Return the validated ``{"model": ..., "effort": ...}`` subset that is set;
+    raise ``ValueError`` naming the bad value otherwise."""
+    options = {}
+    if model is not None:
+        if not isinstance(model, str) or not MODEL_RE.match(model):
+            raise ValueError(
+                f"invalid model {model!r}: use an alias (fable, opus, sonnet, "
+                f"haiku) or a full model id such as claude-opus-5-5"
+            )
+        options["model"] = model
+    if effort is not None:
+        if effort not in EFFORT_LEVELS:
+            raise ValueError(
+                f"invalid effort {effort!r}: use one of {', '.join(EFFORT_LEVELS)}"
+            )
+        options["effort"] = effort
+    return options
+
+
+def option_args(options: dict[str, str]) -> list[str]:
+    args = []
+    for key in ("model", "effort"):
+        if key in options:
+            args += [f"--{key}", options[key]]
+    return args
+
+
 def generate_agent_id(prefix: str = "agent") -> str:
     """Generate a unique predictable agent ID."""
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -66,6 +102,8 @@ async def bridge(
     preamble: str,
     command: list[str],
     log_content: bool = False,
+    default_options: dict[str, str] | None = None,
+    allow_task_overrides: bool = False,
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
@@ -110,6 +148,9 @@ async def bridge(
     if work_topic:
         logger.info("Work queue (shared pool): %s", work_topic)
     logger.info("Outbox: %s | Idle timeout: %ss", outbox, idle_timeout)
+    logger.info("Default options: %s | per-task overrides: %s",
+                " ".join(option_args(default_options or {})) or "none",
+                "allowed" if allow_task_overrides else "refused")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -123,7 +164,9 @@ async def bridge(
             routing_key=routing_key,
         )
 
-    async def run_task(task_text: str, task_id: str | None) -> tuple[int, int, int]:
+    async def run_task(
+        task_text: str, task_id: str | None, options: dict[str, str]
+    ) -> tuple[int, int, int]:
         """Spawn the agent fresh, feed it the task on stdin, republish stdout.
 
         Returns ``(exit code, stdout bytes, stderr bytes)``.
@@ -132,6 +175,7 @@ async def bridge(
 
         proc = await asyncio.create_subprocess_exec(
             *command,
+            *option_args(options),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -215,11 +259,38 @@ async def bridge(
                     logger.info("← task %s: %s", task_id, task[:80])
                 else:
                     logger.info("← task %s (%d bytes)", task_id, len(task.encode()))
-                rc, out_bytes, err_bytes = await run_task(task, task_id)
-                logger.info(
-                    "Task %s complete (rc=%d, stdout=%d bytes, stderr=%d bytes)",
-                    task_id, rc, out_bytes, err_bytes,
-                )
+                options = dict(default_options or {})
+                error = None
+                requested = {k: payload[k] for k in ("model", "effort") if k in payload}
+                if requested and not allow_task_overrides:
+                    error = "this worker does not accept per-task model/effort"
+                elif requested:
+                    try:
+                        options.update(validate_task_options(
+                            requested.get("model"), requested.get("effort")))
+                    except ValueError as exc:
+                        error = str(exc)
+
+                if error is None:
+                    rc, out_bytes, err_bytes = await run_task(task, task_id, options)
+                    logger.info(
+                        "Task %s complete (rc=%d, %s, stdout=%d bytes, stderr=%d bytes)",
+                        task_id, rc, " ".join(option_args(options)) or "default model",
+                        out_bytes, err_bytes,
+                    )
+                else:
+                    # Refuse rather than run with options the sender didn't ask for.
+                    rc = 2
+                    logger.info("Task %s rejected: %s", task_id, error)
+                    rejected = {
+                        "agent_id": agent_id,
+                        "routing_key": outbox,
+                        "type": "output",
+                        "body": f"[agentbridge] task rejected: {error}",
+                    }
+                    if task_id is not None:
+                        rejected["task_id"] = task_id
+                    await publish(outbox, rejected)
                 # Explicit end-of-task marker, so a collector knows the task is
                 # finished without waiting for the idle timeout or relying on the
                 # agent to print a marker string.
@@ -307,6 +378,24 @@ def main() -> None:
              "needs to be mounted into the agent's sandbox.",
     )
     parser.add_argument(
+        "--model",
+        default=None,
+        help="Default model for every task, appended to the wrapped command as "
+             "`--model MODEL` (an alias such as opus, or a full model id).",
+    )
+    parser.add_argument(
+        "--effort",
+        default=None,
+        choices=EFFORT_LEVELS,
+        help="Default effort for every task, appended as `--effort LEVEL`.",
+    )
+    parser.add_argument(
+        "--allow-task-overrides",
+        action="store_true",
+        help='Let a task message set "model"/"effort" for that task, overriding '
+             "the defaults (values are allowlisted).",
+    )
+    parser.add_argument(
         "--log-content",
         action="store_true",
         help="Log task text, agent output and agent stderr (off by default: only "
@@ -325,6 +414,7 @@ def main() -> None:
 
     try:
         amqp_url = resolve_amqp_url(args.amqp_url, args.amqp_url_file, os.environ)
+        default_options = validate_task_options(args.model, args.effort)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -359,6 +449,8 @@ def main() -> None:
         preamble=preamble,
         command=args.command,
         log_content=args.log_content,
+        default_options=default_options,
+        allow_task_overrides=args.allow_task_overrides,
     ))
 
 

@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from agentbridge.bridge import resolve_amqp_url
+from agentbridge.bridge import option_args, resolve_amqp_url, validate_task_options
 
 
 class ResolveAmqpUrl(unittest.TestCase):
@@ -40,6 +40,29 @@ class ResolveAmqpUrl(unittest.TestCase):
             resolve_amqp_url(None, None, {})
         with self.assertRaises(ValueError):
             resolve_amqp_url(None, None, {"AMQP_URL": "  "})
+
+
+class TaskOptions(unittest.TestCase):
+    def test_valid(self):
+        for model in ("fable", "opus", "sonnet", "haiku", "claude-opus-5-5",
+                      "claude-haiku-5-5"):
+            self.assertEqual(validate_task_options(model, None), {"model": model})
+        self.assertEqual(validate_task_options(None, "xhigh"), {"effort": "xhigh"})
+        self.assertEqual(validate_task_options(None, None), {})
+
+    def test_injection_rejected(self):
+        for model in ("--dangerously-skip-permissions", "opus --effort max",
+                      "gpt-4", "Opus", "", "claude-", 42):
+            with self.assertRaises(ValueError):
+                validate_task_options(model, None)
+        for effort in ("extreme", "--max", "", 3):
+            with self.assertRaises(ValueError):
+                validate_task_options(None, effort)
+
+    def test_args_order(self):
+        self.assertEqual(option_args({"effort": "high", "model": "opus"}),
+                         ["--model", "opus", "--effort", "high"])
+        self.assertEqual(option_args({}), [])
 
 
 if __name__ == "__main__":

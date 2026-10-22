@@ -17,6 +17,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 from fastmcp.dependencies import CurrentHeaders
 
+from ..bridge import validate_task_options
 from ..bus import fold_messages
 from . import broker, config, workers, workspace
 from .roles import ROLES
@@ -98,6 +99,8 @@ async def spawn_worker(
     role: str,
     count: int = 1,
     pool: bool = False,
+    model: str | None = None,
+    effort: str | None = None,
     headers: dict = _current_headers,
 ) -> dict:
     """Start `count` workers of `role` (see list_roles). Each worker is a
@@ -107,10 +110,16 @@ async def spawn_worker(
     With pool=True the workers also consume the shared `<role>.work` queue, so
     tasks sent there are load-balanced across them. Each worker is always
     addressable directly as `<id>.inbox`.
+
+    `model` and `effort` set the workers' defaults: model is an alias for the
+    latest of a family (fable, opus, sonnet, haiku) or a full model id such as
+    claude-opus-5-5; effort is low, medium, high, xhigh or max. Omitted, claude
+    uses its own defaults. A single task can override both (see send_task).
     """
     try:
         tenant = tenant_from_headers(headers)
-    except TenantError as e:
+        options = validate_task_options(model, effort)
+    except (TenantError, ValueError) as e:
         return _fail(e)
     if role not in ROLES:
         return _fail(f"unknown role {role!r}; available: {', '.join(ROLES)}")
@@ -140,16 +149,19 @@ async def spawn_worker(
     started = []
     for _ in range(count):
         n = workers.next_index(ids, role)
-        await workers.start(workers.build_command(tenant, role, n, credential, pool))
+        await workers.start(
+            workers.build_command(tenant, role, n, credential, pool, options))
         agent_id = f"{role}-{n}"
         ids.append(agent_id)
         started.append({
             "id": agent_id,
             "inbox": f"{agent_id}.inbox",
             "work_queue": f"{role}.work" if pool else None,
+            "model": options.get("model"),
+            "effort": options.get("effort"),
         })
-    log.info("user=%s tool=spawn_worker role=%s workers=%s", tenant.name, role,
-             ",".join(w["id"] for w in started))
+    log.info("user=%s tool=spawn_worker role=%s workers=%s options=%s", tenant.name,
+             role, ",".join(w["id"] for w in started), options or "default")
     return {"workers": started}
 
 
@@ -165,14 +177,25 @@ async def list_workers(headers: dict = _current_headers) -> dict:
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
                        "openWorldHint": True})
-async def send_task(to: str, body: str, headers: dict = _current_headers) -> dict:
+async def send_task(
+    to: str,
+    body: str,
+    model: str | None = None,
+    effort: str | None = None,
+    headers: dict = _current_headers,
+) -> dict:
     """Send a task to one worker (`<id>.inbox`) or to a role pool
     (`<role>.work`). The agent is stateless — include every piece of context it
     needs in `body`. Returns a task_id; its output and a final `done` entry
-    (with the exit code) appear in collect()."""
+    (with the exit code) appear in collect().
+
+    `model`/`effort` override the worker's defaults for this task only (same
+    values as spawn_worker) — e.g. haiku for quick triage, opus at high effort
+    for a hard task."""
     try:
         tenant = tenant_from_headers(headers)
-    except TenantError as e:
+        options = validate_task_options(model, effort)
+    except (TenantError, ValueError) as e:
         return _fail(e)
     if to.endswith(".inbox"):
         if to.removesuffix(".inbox") not in await _worker_ids(tenant):
@@ -183,23 +206,30 @@ async def send_task(to: str, body: str, headers: dict = _current_headers) -> dic
     else:
         return _fail("`to` must be `<worker id>.inbox` or `<role>.work`")
     task_id = broker.new_task_id()
-    await broker.publish(tenant, to, {"body": body, "task_id": task_id})
-    log.info("user=%s tool=send_task to=%s task=%s bytes=%d", tenant.name, to,
-             task_id, len(body.encode()))
+    await broker.publish(tenant, to, {"body": body, "task_id": task_id, **options})
+    log.info("user=%s tool=send_task to=%s task=%s bytes=%d options=%s", tenant.name,
+             to, task_id, len(body.encode()), options or "default")
     return {"sent": True, "routing_key": to, "task_id": task_id}
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
                        "openWorldHint": True})
-async def broadcast(body: str, headers: dict = _current_headers) -> dict:
-    """Send `body` as a task to every one of your workers at once."""
+async def broadcast(
+    body: str,
+    model: str | None = None,
+    effort: str | None = None,
+    headers: dict = _current_headers,
+) -> dict:
+    """Send `body` as a task to every one of your workers at once (optionally
+    overriding model/effort, as in send_task)."""
     try:
         tenant = tenant_from_headers(headers)
-    except TenantError as e:
+        options = validate_task_options(model, effort)
+    except (TenantError, ValueError) as e:
         return _fail(e)
     task_id = broker.new_task_id()
     await broker.publish(tenant, "orchestrator.broadcast",
-                         {"body": body, "task_id": task_id})
+                         {"body": body, "task_id": task_id, **options})
     log.info("user=%s tool=broadcast task=%s bytes=%d", tenant.name, task_id,
              len(body.encode()))
     return {"sent": True, "task_id": task_id}

@@ -125,6 +125,11 @@ routing key: researcher-01.inbox    body: {"body": "<task text>"}
 - `--outbox` defaults to `{agent_id}.output`. An idle worker is announced on
   `{agent_id}.waiting` after `--idle-timeout` seconds (default 60). Retire it
   with a `{"type": "shutdown"}` message to its inbox.
+- `--model MODEL` / `--effort LEVEL` set defaults appended to the wrapped
+  command for every task (claude's own flags). With `--allow-task-overrides` a
+  task message may carry `"model"` / `"effort"` to override them for that task;
+  values are allowlisted (model alias or `claude-…` id; effort `low`…`max`), and
+  a task with an invalid value is refused with `rc=2` instead of being run.
 - Each stdout line is published as its own `{"type": "output"}` message; when
   the agent exits, the bridge publishes `{"type": "done", "rc": N}` on the same
   outbox. A task may carry a `"task_id"`, which is echoed on its output and
@@ -143,6 +148,10 @@ nginx's `X-Forwarded-User` (the Basic-auth user):
 | Credential | podman secret `anthropic-<u>-apikey` (or `-oauth`), injected into that user's containers only |
 | Workspace | `/srv/agentbridge/<u>/`, mounted at `/workspace` (ro or rw by role) |
 | Workers | transient systemd user units `agentbridge-<u>-<role>-<n>`, capped by `MemoryMax`/`CPUQuota`/`TasksMax` |
+
+Workers can be given a default model and effort at spawn
+(`spawn_worker(role, model="opus", effort="high")`), and any single task can
+override them (`send_task(..., model="haiku", effort="low")`).
 
 Tools: `whoami`, `list_roles`, `spawn_worker`, `list_workers`, `send_task`,
 `broadcast`, `collect`, `retire_worker`, `retire_all`, `workspace_ls`,

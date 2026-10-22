@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 
+from ..bridge import option_args
 from . import config
 from .roles import ROLES, Role
 from .tenant import Tenant
@@ -33,6 +34,7 @@ def build_command(
     n: int,
     credential: tuple[str, str],
     pool: bool,
+    options: dict[str, str] | None = None,
 ) -> list[str]:
     """The full ``systemd-run`` argv for one worker. No secret appears in it:
     the bus URL is read from a 0600 file and the Anthropic credential is
@@ -41,11 +43,13 @@ def build_command(
     agent_id = f"{role_name}-{n}"
     unit = unit_name(tenant, agent_id)
     secret, env_var = credential
+    options = options or {}
+    shown = " ".join(f"{k}={v}" for k, v in options.items()) or "default model"
 
     cmd = [
         "systemd-run", "--user", "--quiet", "--collect",
         f"--unit={unit}",
-        f"--description=agentbridge worker {agent_id} for {tenant.name}",
+        f"--description=agentbridge worker {agent_id} for {tenant.name} ({shown})",
         f"--property=MemoryMax={config.WORKER_MEMORY_MAX}",
         f"--property=CPUQuota={config.WORKER_CPU_QUOTA}",
         f"--property=TasksMax={config.WORKER_TASKS_MAX}",
@@ -56,6 +60,9 @@ def build_command(
         "--exchange", config.EXCHANGE,
         "--amqp-url-file", str(tenant.amqp_url_file),
         "--idle-timeout", str(config.IDLE_TIMEOUT),
+        # Defaults for this worker; tasks may override them (allowlisted).
+        *option_args(options),
+        "--allow-task-overrides",
     ]
     if pool:
         cmd += ["--work-queue", f"{role_name}.work"]
@@ -85,6 +92,16 @@ def build_command(
     return cmd
 
 
+_DESC_OPTIONS = re.compile(r"\(([^()]*)\)\s*$")
+
+
+def _options_from_description(description: str) -> str | None:
+    """The "(model=opus effort=high)" suffix build_command puts in the unit
+    description, without the parentheses."""
+    m = _DESC_OPTIONS.search(description)
+    return m.group(1) if m else None
+
+
 async def list_units(tenant: Tenant) -> list[dict]:
     """The tenant's worker units, as ``{id, unit, active, sub}``."""
     rc, out, err = await _run(
@@ -104,6 +121,7 @@ async def list_units(tenant: Tenant) -> list[dict]:
             "unit": name,
             "active": unit.get("active"),
             "sub": unit.get("sub"),
+            "options": _options_from_description(unit.get("description", "")),
         })
     return workers
 

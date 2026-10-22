@@ -136,6 +136,17 @@ class WorkerCommand(TenantDirs):
         self.assertIn(f"{config.TENANTS_DIR / 'alice.gitconfig'}:/root/.gitconfig:ro", cmd)
         self.assertIn("implementer.work", cmd)
 
+    def test_options_reach_bridge(self):
+        cred = ("anthropic-alice-apikey", "ANTHROPIC_API_KEY")
+        cmd = workers.build_command(self.alice, "researcher", 1, cred, False,
+                                    {"model": "opus", "effort": "high"})
+        podman = cmd.index("podman")
+        # bridge flags (before the wrapped command), not claude argv
+        self.assertEqual(cmd[podman - 9:podman - 5], ["--model", "opus", "--effort", "high"])
+        self.assertIn("--allow-task-overrides", cmd[:podman])
+        self.assertNotIn("--model", cmd[podman:])
+        self.assertTrue(any("(model=opus effort=high)" in a for a in cmd))
+
     def test_next_index(self):
         ids = ["researcher-1", "researcher-4", "implementer-9"]
         self.assertEqual(workers.next_index(ids, "researcher"), 5)
@@ -143,7 +154,8 @@ class WorkerCommand(TenantDirs):
 
     def test_list_units_only_own_prefix(self):
         units = [
-            {"unit": "agentbridge-alice-researcher-1.service", "active": "active", "sub": "running"},
+            {"unit": "agentbridge-alice-researcher-1.service", "active": "active", "sub": "running",
+         "description": "agentbridge worker researcher-1 for alice (model=opus effort=high)"},
             {"unit": "agentbridge-alicex-researcher-1.service", "active": "active", "sub": "running"},
             {"unit": "agentbridge-bob-researcher-1.service", "active": "active", "sub": "running"},
         ]
@@ -151,6 +163,7 @@ class WorkerCommand(TenantDirs):
                                mock.AsyncMock(return_value=(0, json.dumps(units), ""))):
             got = asyncio.run(workers.list_units(self.alice))
         self.assertEqual([w["id"] for w in got], ["researcher-1"])
+        self.assertEqual(got[0]["options"], "model=opus effort=high")
 
 
 class Roles(unittest.TestCase):

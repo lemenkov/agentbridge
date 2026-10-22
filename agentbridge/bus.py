@@ -125,6 +125,10 @@ async def cmd_send(args: argparse.Namespace) -> None:
         # Tag every task so its output and its `done` marker can be matched back
         # to it.
         message = {"body": args.body, "task_id": args.task_id or uuid.uuid4().hex[:12]}
+        if args.model:
+            message["model"] = args.model
+        if args.effort:
+            message["effort"] = args.effort
     await exch.publish(
         aio_pika.Message(
             body=json.dumps(message).encode(),
@@ -219,6 +223,12 @@ def main() -> None:
     p_send.add_argument("--task-id", default=None,
                         help="id for a --body task (default: random); echoed "
                              "on the task's output and done messages")
+    p_send.add_argument("--model", default=None,
+                        help="model for this task (worker must run with "
+                             "--allow-task-overrides)")
+    p_send.add_argument("--effort", default=None,
+                        choices=["low", "medium", "high", "xhigh", "max"],
+                        help="effort for this task (same condition)")
     p_send.set_defaults(func=cmd_send)
 
     p_collect = sub.add_parser("collect", help="consume + print agent output")
