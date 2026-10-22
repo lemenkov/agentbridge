@@ -7,13 +7,15 @@
     agentbridge-admin list
     agentbridge-admin deprovision petro [--purge]
 
-The bus password is service plumbing: generated here, handed to rabbitmqctl on
-stdin, stored 0600 for the service user, and never shown. A user's only secret
+The bus password is service plumbing: generated here, handed to rabbitmqctl
+only as a salted hash, stored 0600 for the service user, and never shown. A user's only secret
 is their Anthropic credential, which the operator registers out of band as a
 podman secret of the service user (printed as the last provisioning step).
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import pwd
@@ -46,14 +48,22 @@ def _service_user() -> pwd.struct_passwd:
         sys.exit(f"service user {name!r} does not exist — run deploy/setup-host.sh first")
 
 
-def _rabbitmqctl(*args: str, stdin: str | None = None, check: bool = True) -> str:
+def _rabbitmqctl(*args: str, check: bool = True) -> str:
     proc = subprocess.run(
-        ["rabbitmqctl", "--quiet", *args], input=stdin, text=True,
+        ["rabbitmqctl", "--quiet", *args], stdin=subprocess.DEVNULL, text=True,
         capture_output=True, check=False,
     )
     if check and proc.returncode != 0:
         sys.exit(f"rabbitmqctl {args[0]} failed: {proc.stderr.strip()}")
     return proc.stdout
+
+
+def _rabbit_password_hash(password: str) -> str:
+    """RabbitMQ's default (rabbit_password_hashing_sha256) stored form:
+    base64(salt || sha256(salt || password)) with a 4-byte random salt. Passing
+    this to `add_user --pre-hashed-password` keeps the password out of argv."""
+    salt = secrets.token_bytes(4)
+    return base64.b64encode(salt + hashlib.sha256(salt + password.encode()).digest()).decode()
 
 
 def _as_service_user(svc: pwd.struct_passwd, *argv: str) -> subprocess.CompletedProcess:
@@ -99,16 +109,17 @@ def cmd_provision(args: argparse.Namespace) -> None:
                     bus_password=record["bus_password"],
                     max_workers=record["limits"]["max_workers"])
 
-    # Broker: vhost + a user permitted on that vhost only. The password goes in
-    # on stdin, never in argv. Re-running resyncs the password to the record.
+    # Broker: vhost + a user permitted on that vhost only. Only a salted hash of
+    # the password reaches argv. change_password has no pre-hashed form, so
+    # re-running re-creates the user to resync it to the record.
     if tenant.vhost not in _rabbitmqctl("list_vhosts", "name").split():
         _rabbitmqctl("add_vhost", tenant.vhost)
     users = [line.split()[0] for line in
              _rabbitmqctl("list_users", "--no-table-headers").splitlines() if line.strip()]
     if tenant.bus_user in users:
-        _rabbitmqctl("change_password", tenant.bus_user, stdin=tenant.bus_password + "\n")
-    else:
-        _rabbitmqctl("add_user", tenant.bus_user, stdin=tenant.bus_password + "\n")
+        _rabbitmqctl("delete_user", tenant.bus_user)
+    _rabbitmqctl("add_user", tenant.bus_user,
+                 _rabbit_password_hash(tenant.bus_password), "--pre-hashed-password")
     _rabbitmqctl("set_permissions", "-p", tenant.vhost, tenant.bus_user,
                  ".*", ".*", ".*")
 
