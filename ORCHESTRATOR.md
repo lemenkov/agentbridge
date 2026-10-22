@@ -25,8 +25,10 @@ their sole point of contact.
 
 ## Starting Up
 
-The bridge takes the message-bus URL as an explicit `--amqp-url` flag and
-**refuses to start without it** (there is no default). Resolve the value in
+The bridge needs the message-bus URL and **refuses to start without it** (there
+is no default). It reads it from `$AMQP_URL` in its environment (or
+`--amqp-url` / `--amqp-url-file`); the recipes below pass it through the
+environment so the password stays out of the process list. Resolve the value in
 this order before spawning:
 
 1. **Your own `$AMQP_URL` environment** — the human may have started you with
@@ -103,8 +105,10 @@ BUS="$AGENTBRIDGE_HOME/venv/bin/agentbus"
 "$BUS" send --to research-1.inbox --body "Summarise /workspace/proj/x.md"
 "$BUS" send --to research.work    --body "..."
 
-# watch results (stops on idle, a wall-clock cap, or a marker substring):
+# watch results (stops on idle, a wall-clock cap, a marker substring, or after
+# N tasks have reported done; --grouped prints one block per task at the end):
 "$BUS" collect --idle 60 --until TASK_COMPLETE
+"$BUS" collect --idle 60 --done 2 --grouped
 
 # retire a worker:
 "$BUS" send --to research-1.inbox --shutdown
@@ -112,7 +116,11 @@ BUS="$AGENTBRIDGE_HOME/venv/bin/agentbus"
 
 `send` declares the destination queue before publishing, so a task is never lost
 if it races a worker's startup. `collect` consumes the shared
-`orchestrator.collect` queue (bound to `*.output` and `*.waiting`).
+`orchestrator.collect` queue (bound to `*.output` and `*.waiting`). `send` tags
+each task with a `task_id` (printed; override with `--task-id`); the bridge
+echoes it on every output line and on the `{"type":"done","rc":N}` message it
+publishes when the agent exits, so you can tell which result is which and when
+each task is finished.
 
 ## Spawning an Agent
 
@@ -132,10 +140,9 @@ AGENTBRIDGE_HOME=/path/to/agentbridge   # this repo's checkout
 : "${AMQP_URL:?set AMQP_URL to the human-provided bus URL before spawning}"
 CLAUDE_VER=$(basename "$(readlink -f ~/.local/bin/claude)")
 
-nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
+AMQP_URL="$AMQP_URL" nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
     --agent {role}-{id} \
     --inbox {role}-{id}.inbox \
-    --amqp-url "$AMQP_URL" \
     --idle-timeout 45 \
     --preamble-file "$AGENTBRIDGE_HOME"/AGENT.md \
     --preamble-file "$AGENTBRIDGE_HOME"/SKILLS/{role}.md \
@@ -214,12 +221,16 @@ after finishing any task in flight.
 - MCP servers are NOT mounted — `claude` reaches them over HTTPS via the
   mounted `~/.claude` credentials and `~/.claude.json` config.
 - Monitor the container: `journalctl CONTAINER_TAG=agentbridge-{role}-{id} -f`.
-  Monitor the bridge: its redirected log (`~/.cache/agentbridge-{role}-{id}.log`).
+  Monitor the bridge: its redirected log (`~/.cache/agentbridge-{role}-{id}.log`),
+  or `journalctl SYSLOG_IDENTIFIER=agentbridge-{role}-{id}` with the `systemd`
+  extra. It logs task ids, byte counts and exit codes only; add `--log-content`
+  to the bridge flags to also see task text, agent output and agent stderr.
 - Each task spawns a **fresh container** (cold `podman run` + claude start, a
   second or two of overhead); the worker bridge persists across tasks. Retire it
   with a `{"type":"shutdown"}` message, or kill the host bridge process.
-- The bus URL is passed explicitly via `--amqp-url "$AMQP_URL"` (see *Starting
-  Up* for how to resolve `$AMQP_URL`). The bridge has no default and refuses to
+- The bus URL is passed through the environment (`AMQP_URL="$AMQP_URL"`), not
+  as `--amqp-url`, so the password never shows up in `ps` (see *Starting Up*
+  for how to resolve `$AMQP_URL`). The bridge has no default and refuses to
   start without it; the `:?` guard above aborts even earlier if it is unset.
 
 ## Worker Pools
@@ -230,10 +241,10 @@ several workers of the same role as a **pool** — give them all the same
 
 ```bash
 for i in 1 2 3; do
-    nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
+    AMQP_URL="$AMQP_URL" nohup "$AGENTBRIDGE_HOME"/venv/bin/agentbridge \
         --agent research-$i --inbox research-$i.inbox \
         --work-queue research.work \
-        --amqp-url "$AMQP_URL" --idle-timeout 45 \
+        --idle-timeout 45 \
         --preamble-file "$AGENTBRIDGE_HOME"/AGENT.md \
         --preamble-file "$AGENTBRIDGE_HOME"/SKILLS/researcher.md \
         podman run ... &        # same podman block as the single-worker recipe

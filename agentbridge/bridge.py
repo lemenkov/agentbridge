@@ -17,11 +17,37 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 
 import aio_pika
+
+
+def resolve_amqp_url(
+    flag: str | None, path: str | None, environ: Mapping[str, str]
+) -> str:
+    """Resolve the bus URL: --amqp-url, else --amqp-url-file, else $AMQP_URL.
+
+    There is deliberately no default: with none of the three set this raises.
+    """
+    if flag:
+        return flag
+    if path:
+        with open(path, encoding="utf-8") as fh:
+            url = fh.readline().strip()
+        if not url:
+            raise ValueError(f"--amqp-url-file {path} is empty")
+        return url
+    url = environ.get("AMQP_URL", "").strip()
+    if url:
+        return url
+    raise ValueError(
+        "no AMQP URL — pass --amqp-url, --amqp-url-file, or set $AMQP_URL "
+        "(there is no default)"
+    )
 
 
 def generate_agent_id(prefix: str = "agent") -> str:
@@ -39,6 +65,7 @@ async def bridge(
     idle_timeout: float,
     preamble: str,
     command: list[str],
+    log_content: bool = False,
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
@@ -84,6 +111,8 @@ async def bridge(
         logger.info("Work queue (shared pool): %s", work_topic)
     logger.info("Outbox: %s | Idle timeout: %ss", outbox, idle_timeout)
     logger.info("Agent command: %s", " ".join(command))
+    if not log_content:
+        logger.info("Content logging off: task/output/stderr text is not logged")
 
     async def publish(routing_key: str, obj: dict) -> None:
         await exch.publish(
@@ -94,8 +123,11 @@ async def bridge(
             routing_key=routing_key,
         )
 
-    async def run_task(task_text: str) -> int:
-        """Spawn the agent fresh, feed it the task on stdin, republish stdout."""
+    async def run_task(task_text: str, task_id: str | None) -> tuple[int, int, int]:
+        """Spawn the agent fresh, feed it the task on stdin, republish stdout.
+
+        Returns ``(exit code, stdout bytes, stderr bytes)``.
+        """
         payload = f"{preamble}\n\nYour task: {task_text}" if preamble else task_text
 
         proc = await asyncio.create_subprocess_exec(
@@ -108,27 +140,37 @@ async def bridge(
         await proc.stdin.drain()
         proc.stdin.close()  # EOF so the agent starts processing the prompt
 
+        counts = {"stdout": 0, "stderr": 0}
+
         async def pump_stdout() -> None:
             async for line in proc.stdout:
+                counts["stdout"] += len(line)
                 text = line.decode(errors="replace").rstrip()
                 if not text:
                     continue
-                await publish(outbox, {
+                message = {
                     "agent_id": agent_id,
                     "routing_key": outbox,
                     "type": "output",
                     "body": text,
-                })
-                logger.info("→ %s: %s", outbox, text[:80])
+                }
+                if task_id is not None:
+                    message["task_id"] = task_id
+                await publish(outbox, message)
+                if log_content:
+                    logger.info("→ %s: %s", outbox, text[:80])
 
         async def pump_stderr() -> None:
             async for line in proc.stderr:
-                # Forward to real stderr so humans/journald can observe.
-                sys.stderr.write(line.decode(errors="replace"))
-                sys.stderr.flush()
+                counts["stderr"] += len(line)
+                # Forward to real stderr so humans/journald can observe — only
+                # when content logging is on, since it may echo task text.
+                if log_content:
+                    sys.stderr.write(line.decode(errors="replace"))
+                    sys.stderr.flush()
 
         await asyncio.gather(pump_stdout(), pump_stderr())
-        return await proc.wait()
+        return await proc.wait(), counts["stdout"], counts["stderr"]
 
     last_activity = time.monotonic()
     idle_announced = False
@@ -168,9 +210,28 @@ async def bridge(
                 stop = True
             else:
                 task = payload.get("body", "")
-                logger.info("← task: %s", task[:80])
-                rc = await run_task(task)
-                logger.info("Task complete (rc=%d)", rc)
+                task_id = payload.get("task_id")
+                if log_content:
+                    logger.info("← task %s: %s", task_id, task[:80])
+                else:
+                    logger.info("← task %s (%d bytes)", task_id, len(task.encode()))
+                rc, out_bytes, err_bytes = await run_task(task, task_id)
+                logger.info(
+                    "Task %s complete (rc=%d, stdout=%d bytes, stderr=%d bytes)",
+                    task_id, rc, out_bytes, err_bytes,
+                )
+                # Explicit end-of-task marker, so a collector knows the task is
+                # finished without waiting for the idle timeout or relying on the
+                # agent to print a marker string.
+                done = {
+                    "agent_id": agent_id,
+                    "routing_key": outbox,
+                    "type": "done",
+                    "rc": rc,
+                }
+                if task_id is not None:
+                    done["task_id"] = task_id
+                await publish(outbox, done)
 
         last_activity = time.monotonic()
         idle_announced = False
@@ -193,11 +254,18 @@ def main() -> None:
         default="agent",
         help="Prefix for auto-generated agent ID (default: agent)",
     )
-    parser.add_argument(
+    url_source = parser.add_mutually_exclusive_group()
+    url_source.add_argument(
         "--amqp-url",
-        required=True,
-        help="RabbitMQ AMQP URL (required). The bridge refuses to start without "
-             "it — there is no default.",
+        default=None,
+        help="RabbitMQ AMQP URL. Visible in the process list — prefer "
+             "--amqp-url-file or $AMQP_URL when the URL carries a password.",
+    )
+    url_source.add_argument(
+        "--amqp-url-file",
+        default=None,
+        metavar="PATH",
+        help="Read the AMQP URL from this file (first line).",
     )
     parser.add_argument(
         "--exchange",
@@ -239,6 +307,12 @@ def main() -> None:
              "needs to be mounted into the agent's sandbox.",
     )
     parser.add_argument(
+        "--log-content",
+        action="store_true",
+        help="Log task text, agent output and agent stderr (off by default: only "
+             "task ids, byte counts and exit codes are logged).",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Agent command to spawn per task (e.g. claude --print). The task is "
@@ -248,6 +322,11 @@ def main() -> None:
 
     if not args.command:
         parser.error("No command specified — provide a command to wrap after the options")
+
+    try:
+        amqp_url = resolve_amqp_url(args.amqp_url, args.amqp_url_file, os.environ)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     agent_id = args.agent or generate_agent_id(args.agent_prefix)
 
@@ -271,7 +350,7 @@ def main() -> None:
 
     asyncio.run(bridge(
         agent_id=agent_id,
-        amqp_url=args.amqp_url,
+        amqp_url=amqp_url,
         exchange=args.exchange,
         inbox_topic=args.inbox,
         work_topic=args.work_queue,
@@ -279,6 +358,7 @@ def main() -> None:
         idle_timeout=args.idle_timeout,
         preamble=preamble,
         command=args.command,
+        log_content=args.log_content,
     ))
 
 

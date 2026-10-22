@@ -92,10 +92,9 @@ isolated container; see [ORCHESTRATOR.md](ORCHESTRATOR.md) for that recipe.
 For reference, the bridge's own CLI contract is:
 
 ```bash
-agentbridge \
+AMQP_URL=amqp://agentbridge:YOURPASSWORD@rabbitmq.host/ agentbridge \
     --agent researcher-01 \
     --inbox researcher-01.inbox \
-    --amqp-url amqp://agentbridge:YOURPASSWORD@rabbitmq.host/ \
     --preamble-file AGENT.md --preamble-file SKILLS/researcher.md \
     claude --print --dangerously-skip-permissions
 ```
@@ -107,7 +106,13 @@ agent's stdin as it arrives. To give it work, publish a task to its inbox:
 routing key: researcher-01.inbox    body: {"body": "<task text>"}
 ```
 
-- `--amqp-url` is **required** — the bridge refuses to start without it.
+- The bus URL is **required** — from `--amqp-url`, else `--amqp-url-file PATH`
+  (first line), else `$AMQP_URL`; the bridge refuses to start with none of
+  them. Prefer the file or the environment when the URL carries a password:
+  `--amqp-url` puts it in the process list.
+- By default the bridge logs only task ids, byte counts and exit codes — never
+  task text, agent output or agent stderr. `--log-content` turns those back on
+  for debugging.
 - `--preamble-file` (repeatable) is prepended to every task as the agent's role
   context; it is read host-side, so it needn't be mounted into a sandbox.
 - The wrapped command follows the bridge's own flags directly, takes **no
@@ -120,6 +125,10 @@ routing key: researcher-01.inbox    body: {"body": "<task text>"}
 - `--outbox` defaults to `{agent_id}.output`. An idle worker is announced on
   `{agent_id}.waiting` after `--idle-timeout` seconds (default 60). Retire it
   with a `{"type": "shutdown"}` message to its inbox.
+- Each stdout line is published as its own `{"type": "output"}` message; when
+  the agent exits, the bridge publishes `{"type": "done", "rc": N}` on the same
+  outbox. A task may carry a `"task_id"`, which is echoed on its output and
+  done messages (`agentbus send` adds one automatically).
 
 ## Requirements
 

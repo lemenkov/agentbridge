@@ -12,6 +12,7 @@ use this — they only speak to their bridge over stdio. The AMQP URL comes from
     agentbus send --to research.work --body "Summarise paper X"
     agentbus send --to research-1.inbox --shutdown
     agentbus collect --idle 30 --until TASK_COMPLETE
+    agentbus collect --done 3 --grouped
 """
 
 import argparse
@@ -20,6 +21,7 @@ import json
 import os
 import sys
 import time
+import uuid
 
 import aio_pika
 
@@ -51,6 +53,49 @@ async def _declare_collector(channel, exch):
     return queue
 
 
+def fold_messages(messages: list[dict]) -> list[dict]:
+    """Fold per-line bus messages into one result per (agent, task).
+
+    The bridge publishes every non-empty stdout line as its own ``output``
+    message and ends each task with a ``done`` message carrying ``rc``. This
+    joins the lines of each task, in arrival order, into a single ``body``.
+    ``waiting_for_input`` messages pass through as their own entries. A result
+    whose ``done`` has not arrived yet has ``done: False`` and ``rc: None``.
+    """
+    results: list[dict] = []
+    open_by_key: dict[tuple, dict] = {}
+    for msg in messages:
+        agent = msg.get("agent_id", "?")
+        kind = msg.get("type", "output")
+        if kind == "waiting_for_input":
+            results.append({"agent_id": agent, "type": "waiting"})
+            continue
+        key = (agent, msg.get("task_id"))
+        entry = open_by_key.get(key)
+        if entry is None:
+            entry = {
+                "agent_id": agent,
+                "task_id": msg.get("task_id"),
+                "type": "result",
+                "lines": [],
+                "done": False,
+                "rc": None,
+            }
+            open_by_key[key] = entry
+            results.append(entry)
+        if kind == "done":
+            entry["done"] = True
+            entry["rc"] = msg.get("rc")
+            # A later task reusing the same key (e.g. no task_id) starts fresh.
+            del open_by_key[key]
+        else:
+            entry["lines"].append(str(msg.get("body", "")))
+    for entry in results:
+        if entry["type"] == "result":
+            entry["body"] = "\n".join(entry.pop("lines"))
+    return results
+
+
 async def cmd_setup(args: argparse.Namespace) -> None:
     conn, channel, exch = await _connect(args)
     queue = await _declare_collector(channel, exch)
@@ -77,7 +122,9 @@ async def cmd_send(args: argparse.Namespace) -> None:
     elif args.json is not None:
         message = json.loads(args.json)
     else:
-        message = {"body": args.body}
+        # Tag every task so its output and its `done` marker can be matched back
+        # to it.
+        message = {"body": args.body, "task_id": args.task_id or uuid.uuid4().hex[:12]}
     await exch.publish(
         aio_pika.Message(
             body=json.dumps(message).encode(),
@@ -85,7 +132,8 @@ async def cmd_send(args: argparse.Namespace) -> None:
         ),
         routing_key=args.to,
     )
-    print(f"sent -> {args.to}: {message.get('type', 'task')} "
+    task_id = f" [{message['task_id']}]" if "task_id" in message else ""
+    print(f"sent -> {args.to}: {message.get('type', 'task')}{task_id} "
           f"{str(message.get('body', '')).strip()[:60]}")
     await conn.close()
 
@@ -94,6 +142,8 @@ async def cmd_collect(args: argparse.Namespace) -> None:
     conn, channel, exch = await _connect(args)
     queue = await _declare_collector(channel, exch)
     start = last = time.monotonic()
+    received: list[dict] = []
+    done_count = 0
     # basic_get polling: a timed-out async-iterator read corrupts aio_pika's
     # queue iterator, so we poll instead.
     while True:
@@ -113,12 +163,32 @@ async def cmd_collect(args: argparse.Namespace) -> None:
                 payload = json.loads(message.body.decode())
             except json.JSONDecodeError:
                 payload = {"body": message.body.decode(errors="replace")}
-            tag = "WAIT" if payload.get("type") == "waiting_for_input" else "OUT"
+            received.append(payload)
+            kind = payload.get("type")
             line = payload.get("body", "")
-            print(f"[{tag}|{payload.get('agent_id', '?')}] {line}")
+            if kind == "done":
+                done_count += 1
+                if not args.grouped:
+                    print(f"[DONE|{payload.get('agent_id', '?')}] "
+                          f"task={payload.get('task_id')} rc={payload.get('rc')}")
+                if args.done and done_count >= args.done:
+                    print(f"[collect] {done_count} task(s) done — stop")
+                    break
+                continue
+            if not args.grouped:
+                tag = "WAIT" if kind == "waiting_for_input" else "OUT"
+                print(f"[{tag}|{payload.get('agent_id', '?')}] {line}")
             if args.until and args.until in line:
                 print("[collect] matched --until — stop")
                 break
+    if args.grouped:
+        for entry in fold_messages(received):
+            if entry["type"] == "waiting":
+                print(f"=== {entry['agent_id']}: waiting for input")
+                continue
+            state = f"rc={entry['rc']}" if entry["done"] else "still running"
+            print(f"=== {entry['agent_id']} task={entry['task_id']} ({state})")
+            print(entry["body"])
     await conn.close()
 
 
@@ -146,6 +216,9 @@ def main() -> None:
     group.add_argument("--json", help="raw JSON message body")
     group.add_argument("--shutdown", action="store_true",
                        help='send {"type": "shutdown"}')
+    p_send.add_argument("--task-id", default=None,
+                        help="id for a --body task (default: random); echoed "
+                             "on the task's output and done messages")
     p_send.set_defaults(func=cmd_send)
 
     p_collect = sub.add_parser("collect", help="consume + print agent output")
@@ -155,6 +228,11 @@ def main() -> None:
                            help="stop after N seconds total (default 300)")
     p_collect.add_argument("--until", default=None,
                            help="stop when an output line contains this substring")
+    p_collect.add_argument("--done", type=int, default=0, metavar="N",
+                           help="stop after N tasks have reported done")
+    p_collect.add_argument("--grouped", action="store_true",
+                           help="print one block per (agent, task) at the end "
+                                "instead of streaming lines")
     p_collect.set_defaults(func=cmd_collect)
 
     args = parser.parse_args()
