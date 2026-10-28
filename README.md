@@ -166,12 +166,22 @@ sudo deploy/setup-host.sh                       # service user, images, unit
 sudo venv/bin/agentbridge-admin provision <u> --git-name "..." --git-email "..."
 ```
 
-`setup-host.sh` prints the remaining manual steps: the nginx location
+Provisioning lives on a **separate endpoint** (`/mcp/agentbridge-admin`, its own
+port) so that an orchestrator reading untrusted agent output holds no handle to
+the tools that create and delete tenants; reaching it is not enough, the
+caller's tenant record must also say `"admin": true`.
+
+`setup-host.sh` prints the remaining manual steps: the nginx locations
 (`deploy/nginx-location.conf`), binding RabbitMQ to loopback, and registering
 each user's Anthropic credential out of band. That credential is the only
 secret a user hands over; it sits in a 0600 store on a host the operator is
 root on, so users should register a dedicated, spend-capped key and watch
 their own usage.
+
+**Read [SECURITY.md](SECURITY.md) before provisioning a second user.** It states
+the threat model, what the service enforces, and the known limitations — in
+particular that the identity header is trusted unconditionally, so any local
+process on the host can act as any tenant.
 
 ## Requirements
 
