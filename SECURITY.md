@@ -169,10 +169,22 @@ repository or a web page.
 - Keep RabbitMQ's management API and AMQP port bound to loopback.
 - Keep `/etc/sysconfig/mcp-agentbridge` mode 0600 — it holds the broker
   administrator's password.
-- Ensure nginx can traverse to this service's password file
-  (`/var/lib/mcp-agentbridge` mode 0711). If it cannot, authenticated requests
-  fail with 500 while unauthenticated ones still return a clean 401, which is a
-  confusing failure to diagnose.
+- Ensure nginx can both traverse to and read this service's password file.
+  Three things are needed, and any one of them being wrong gives the same
+  confusing symptom — a 500 for requests that *carry* credentials while
+  unauthenticated ones still get a clean 401:
+  - `0711` on `/var/lib/mcp-agentbridge`, so nginx can traverse it;
+  - **`2750` on `/var/lib/mcp-agentbridge/htpasswd`** — setgid, so a file
+    created there inherits nginx's group. The service account is not a member
+    of that group and therefore cannot `chgrp`, so without setgid every
+    service-side rewrite (`set_password`, `provision_user`) silently drops the
+    group and breaks every login;
+  - `0640 agentbridge:nginx` on the file itself.
+
+  `deploy/setup-host.sh` sets all three, and `agentbridge-admin provision`
+  repairs them. Verify with one authenticated request through nginx after any
+  provisioning change: a loopback test cannot see this failure, because it
+  never touches Basic auth.
 - Register each tenant's credential out of band. It should never pass through a
   conversation.
 - Grant `--admin` to as few tenants as possible, and remember that an admin can

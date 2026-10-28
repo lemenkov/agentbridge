@@ -101,7 +101,12 @@ def _fix_htpasswd_ownership(svc: pwd.struct_passwd) -> None:
         web_gid = svc.pw_gid
     directory = config.HTPASSWD_FILE.parent
     for path, mode, gid in (
-        (directory, 0o750, web_gid),
+        # setgid (2750): a file created here inherits the directory's group,
+        # so the service — which is NOT in nginx's group and therefore cannot
+        # chgrp — still leaves a file nginx can read. Without this, every
+        # service-side rewrite (provision_user, set_password) silently drops
+        # the group and nginx answers 500 to authenticated requests only.
+        (directory, 0o2750, web_gid),
         (config.HTPASSWD_FILE, 0o640, web_gid),
         (directory / ".lock", 0o640, svc.pw_gid),
         (config.HTPASSWD_FILE.with_name(config.HTPASSWD_FILE.name + ".bak"),

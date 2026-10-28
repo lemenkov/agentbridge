@@ -97,6 +97,11 @@ def _write_lines(path: Path, lines: list[str]) -> None:
         os.chmod(tmp, mode)
         if os.geteuid() == 0 or gid in os.getgroups():
             os.chown(tmp, uid, gid)
+        # Otherwise the group is whatever the directory gives us. That is why
+        # the directory is setgid to nginx's group (see
+        # admin._fix_htpasswd_ownership): a non-root process cannot chgrp to a
+        # group it does not belong to, and a file nginx cannot read turns
+        # every authenticated request into a 500.
         if path.exists():
             # Keep one generation back: recovering a lost line beats recreating
             # every tenant's password.

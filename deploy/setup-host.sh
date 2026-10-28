@@ -56,6 +56,21 @@ as_svc() {
 install -d -m 0700 -o "$SVC" -g "$SVC" "$SVC_HOME/tenants"
 install -d -m 0750 -o "$SVC" -g "$SVC" /srv/agentbridge
 
+# This service's own nginx password file. Three permissions matter, and getting
+# any of them wrong produces the same confusing symptom — nginx answers 500 to
+# requests that CARRY credentials while unauthenticated ones still get a clean
+# 401, which looks nothing like a permissions problem:
+#
+#   0711 on $SVC_HOME   so nginx can traverse to the directory below
+#   2750 on htpasswd/   setgid, so a file created here inherits nginx's group.
+#                       The service is not in that group and so cannot chgrp;
+#                       without setgid every service-side rewrite (set_password,
+#                       provision_user) silently drops the group.
+#   0640 agentbridge:nginx on the file itself
+WEB_GROUP=$(getent group nginx >/dev/null && echo nginx || echo "$SVC")
+chmod 0711 "$SVC_HOME"
+install -d -m 2750 -o "$SVC" -g "$WEB_GROUP" "$SVC_HOME/htpasswd"
+
 # --- claude binary, mounted read-only into leaves -----------------------------
 SRC=${1:-}
 if [[ -z $SRC ]]; then
@@ -102,7 +117,21 @@ Done. Remaining manual steps:
 3. Per user:
        $REPO/venv/bin/agentbridge-admin provision <user> \\
            --git-name "Full Name" --git-email user@example.com
-       htpasswd /etc/nginx/.htpasswd-mcp <user>        # if not already there
+       # provision writes this service's OWN password file
+       # ($SVC_HOME/htpasswd/users) and prints the one-time password. Do NOT
+       # add the user to /etc/nginx/.htpasswd-mcp — that file is server-level
+       # and would grant every MCP on this host.
        runuser -u $SVC -- env XDG_RUNTIME_DIR=/run/user/$SVC_UID \\
            podman secret create anthropic-<user>-apikey -    # or -oauth (claude setup-token)
+
+4. Verify through nginx, WITH credentials. Every other check can be done on
+   loopback, but only this one exercises Basic auth and the password file's
+   permissions — the failure mode above is invisible to a loopback test:
+       curl -u <user> https://<host>/mcp/agentbridge \
+           -H 'Content-Type: application/json' \
+           -H 'Accept: application/json, text/event-stream' \
+           -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+   Expect a JSON-RPC result naming the server. A 500 here means nginx cannot
+   read the password file; re-run `agentbridge-admin provision <user>`, which
+   repairs its ownership and mode.
 EOF
