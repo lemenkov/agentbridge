@@ -12,6 +12,11 @@ PORT=8817
 ADMIN_PORT=8818
 MCP_TRANSPORT=streamable-http
 
+# How workers run and parse claude. claude-stream-json adds
+# `--output-format stream-json --verbose` and yields tool progress and real
+# token/cost metrics; claude-text is the fallback (no metrics).
+AGENT_DRIVER=claude-stream-json
+
 # Identity comes only from this header, which nginx sets from the Basic-auth
 # user (and overwrites any client-supplied value).
 USER_HEADER=x-forwarded-user

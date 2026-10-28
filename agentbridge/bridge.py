@@ -26,6 +26,19 @@ from collections.abc import Mapping
 
 import aio_pika
 
+from . import ledger
+from .drivers import DEFAULT_DRIVER, DRIVERS, make_driver
+
+# stream-json's init event enumerates the agent's tools and skills; it was
+# 39 KB in a host capture, and asyncio's default 64 KiB stream limit would
+# turn a longer one into a dead task. Read generously instead.
+STREAM_LIMIT = 4 * 1024 * 1024
+
+# At most one progress message per task per this many seconds (plan B.1): a
+# tool-heavy task would otherwise publish hundreds, and progress exists to
+# show liveness, not to be a transcript.
+PROGRESS_INTERVAL = 5.0
+
 
 def resolve_amqp_url(
     flag: str | None, path: str | None, environ: Mapping[str, str]
@@ -104,6 +117,10 @@ async def bridge(
     log_content: bool = False,
     default_options: dict[str, str] | None = None,
     allow_task_overrides: bool = False,
+    driver_name: str = DEFAULT_DRIVER,
+    ledger_file: str | None = None,
+    role: str | None = None,
+    backend: str = "anthropic",
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
@@ -141,6 +158,9 @@ async def bridge(
 
     outbox = outbox_topic or f"{agent_id}.output"
     waiting_key = f"{agent_id}.waiting"
+    # Deliberately not bound to the collector's queue, so `collect` is
+    # unchanged by this traffic; Part C's tap consumes it.
+    progress_key = f"{agent_id}.progress"
 
     logger = logging.getLogger(__name__)
     logger.info("Worker %s ready", agent_id)
@@ -151,6 +171,9 @@ async def bridge(
     logger.info("Default options: %s | per-task overrides: %s",
                 " ".join(option_args(default_options or {})) or "none",
                 "allowed" if allow_task_overrides else "refused")
+    logger.info("Driver: %s | role: %s | backend: %s",
+                driver_name, role or "unset", backend)
+    logger.info("Ledger: %s", ledger_file or "off")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -166,46 +189,89 @@ async def bridge(
 
     async def run_task(
         task_text: str, task_id: str | None, options: dict[str, str]
-    ) -> tuple[int, int, int]:
+    ) -> dict:
         """Spawn the agent fresh, feed it the task on stdin, republish stdout.
 
-        Returns ``(exit code, stdout bytes, stderr bytes)``.
+        Returns ``{rc, stdout, stderr, metrics, driver_error, progress}``.
         """
         payload = f"{preamble}\n\nYour task: {task_text}" if preamble else task_text
+        driver = make_driver(driver_name)
 
         proc = await asyncio.create_subprocess_exec(
             *command,
+            *driver.extra_args,
             *option_args(options),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STREAM_LIMIT,
         )
         proc.stdin.write(payload.encode())
         await proc.stdin.drain()
         proc.stdin.close()  # EOF so the agent starts processing the prompt
 
-        counts = {"stdout": 0, "stderr": 0}
+        counts = {"stdout": 0, "stderr": 0, "progress": 0, "overruns": 0}
+        last_progress = 0.0
 
-        async def pump_stdout() -> None:
-            async for line in proc.stdout:
-                counts["stdout"] += len(line)
-                text = line.decode(errors="replace").rstrip()
-                if not text:
-                    continue
+        async def emit(event) -> None:
+            nonlocal last_progress
+            if event.kind == "output":
                 message = {
                     "agent_id": agent_id,
                     "routing_key": outbox,
                     "type": "output",
-                    "body": text,
+                    "body": event.body,
                 }
                 if task_id is not None:
                     message["task_id"] = task_id
                 await publish(outbox, message)
                 if log_content:
-                    logger.info("→ %s: %s", outbox, text[:80])
+                    logger.info("→ %s: %s", outbox, (event.body or "")[:80])
+                return
+            # progress: throttled, and never carrying agent text.
+            now = time.monotonic()
+            if counts["progress"] and (now - last_progress) < PROGRESS_INTERVAL:
+                return
+            last_progress = now
+            counts["progress"] += 1
+            message = {
+                "agent_id": agent_id,
+                "routing_key": progress_key,
+                "type": "progress",
+                "ts": ledger.now_iso(),
+            }
+            if event.tool:
+                message["tool"] = event.tool
+            if event.phase:
+                message["phase"] = event.phase
+            if task_id is not None:
+                message["task_id"] = task_id
+            await publish(progress_key, message)
+
+        async def pump_stdout() -> None:
+            while True:
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError:
+                    # A single line longer than STREAM_LIMIT. Drop it rather
+                    # than abandon the task, and let `done` report it.
+                    counts["overruns"] += 1
+                    continue
+                if not line:
+                    break
+                counts["stdout"] += len(line)
+                for event in driver.feed(line.decode(errors="replace")):
+                    await emit(event)
 
         async def pump_stderr() -> None:
-            async for line in proc.stderr:
+            while True:
+                try:
+                    line = await proc.stderr.readline()
+                except ValueError:
+                    counts["overruns"] += 1
+                    continue
+                if not line:
+                    break
                 counts["stderr"] += len(line)
                 # Forward to real stderr so humans/journald can observe — only
                 # when content logging is on, since it may echo task text.
@@ -214,7 +280,60 @@ async def bridge(
                     sys.stderr.flush()
 
         await asyncio.gather(pump_stdout(), pump_stderr())
-        return await proc.wait(), counts["stdout"], counts["stderr"]
+        rc = await proc.wait()
+        metrics, driver_error = driver.finish()
+        if counts["overruns"]:
+            driver_error = (
+                f"{driver_error}; {counts['overruns']} over-long lines dropped"
+                if driver_error
+                else f"{counts['overruns']} over-long lines dropped"
+            )
+        return {
+            "rc": rc,
+            "stdout": counts["stdout"],
+            "stderr": counts["stderr"],
+            "progress": counts["progress"],
+            "metrics": metrics,
+            "driver_error": driver_error,
+        }
+
+    def record_task(
+        task_id: str | None,
+        options: dict[str, str],
+        result: dict,
+        ts_start: str,
+        duration_ms: int,
+    ) -> None:
+        """Append one ledger line. A ledger failure must not fail the task."""
+        if not ledger_file:
+            return
+        metrics = result.get("metrics") or {}
+        record = {
+            "kind": "task",
+            "ts_start": ts_start,
+            "ts_end": ledger.now_iso(),
+            "task_id": task_id,
+            "worker": agent_id,
+            "role": role,
+            "backend": backend,
+            "driver": driver_name,
+            "effort": options.get("effort"),
+            "rc": result["rc"],
+            # Wall clock as the worker saw it: it includes container start,
+            # which the agent's own duration does not.
+            "duration_ms": duration_ms,
+            **{k: v for k, v in metrics.items() if k != "models"},
+        }
+        record.setdefault("model", options.get("model"))
+        if metrics.get("models"):
+            record["models"] = metrics["models"]
+        if result.get("driver_error"):
+            record["driver_error"] = result["driver_error"]
+        try:
+            ledger.append(ledger_file, {k: v for k, v in record.items()
+                                        if v is not None})
+        except OSError as exc:
+            logger.warning("Ledger append failed for task %s: %s", task_id, exc)
 
     last_activity = time.monotonic()
     idle_announced = False
@@ -271,13 +390,34 @@ async def bridge(
                     except ValueError as exc:
                         error = str(exc)
 
+                result: dict | None = None
                 if error is None:
-                    rc, out_bytes, err_bytes = await run_task(task, task_id, options)
+                    ts_start = ledger.now_iso()
+                    started = time.monotonic()
+                    start_message = {
+                        "agent_id": agent_id,
+                        "routing_key": progress_key,
+                        "type": "start",
+                        "ts": ts_start,
+                    }
+                    if task_id is not None:
+                        start_message["task_id"] = task_id
+                    await publish(progress_key, start_message)
+
+                    result = await run_task(task, task_id, options)
+                    rc = result["rc"]
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    record_task(task_id, options, result, ts_start, duration_ms)
                     logger.info(
-                        "Task %s complete (rc=%d, %s, stdout=%d bytes, stderr=%d bytes)",
+                        "Task %s complete (rc=%d, %s, stdout=%d bytes, "
+                        "stderr=%d bytes, progress=%d, %.1fs)",
                         task_id, rc, " ".join(option_args(options)) or "default model",
-                        out_bytes, err_bytes,
+                        result["stdout"], result["stderr"], result["progress"],
+                        duration_ms / 1000,
                     )
+                    if result["driver_error"]:
+                        logger.warning("Task %s driver: %s",
+                                       task_id, result["driver_error"])
                 else:
                     # Refuse rather than run with options the sender didn't ask for.
                     rc = 2
@@ -302,6 +442,13 @@ async def bridge(
                 }
                 if task_id is not None:
                     done["task_id"] = task_id
+                if result is not None:
+                    # Null rather than absent when the driver could not produce
+                    # them, so a collector can tell "no metrics" from "metrics
+                    # not supported".
+                    done["metrics"] = result["metrics"]
+                    if result["driver_error"]:
+                        done["driver_error"] = result["driver_error"]
                 await publish(outbox, done)
 
         last_activity = time.monotonic()
@@ -396,6 +543,34 @@ def main() -> None:
              "the defaults (values are allowlisted).",
     )
     parser.add_argument(
+        "--driver",
+        default=DEFAULT_DRIVER,
+        choices=sorted(DRIVERS),
+        help="How to run and parse the agent (default: %(default)s). "
+             "claude-stream-json adds --output-format stream-json --verbose to "
+             "the wrapped command and yields tool progress and token/cost "
+             "metrics; claude-text treats every stdout line as output and "
+             "works with any command.",
+    )
+    parser.add_argument(
+        "--ledger-file",
+        default=None,
+        metavar="PATH",
+        help="Append one JSON metadata line per finished task (ids, model, "
+             "counters, timings, cost — never task text or output). Keep it "
+             "outside any workspace an agent can write to.",
+    )
+    parser.add_argument(
+        "--role",
+        default=None,
+        help="Role name recorded in the ledger (not passed to the agent).",
+    )
+    parser.add_argument(
+        "--backend",
+        default="anthropic",
+        help="Model backend recorded in the ledger (default: %(default)s).",
+    )
+    parser.add_argument(
         "--log-content",
         action="store_true",
         help="Log task text, agent output and agent stderr (off by default: only "
@@ -434,9 +609,11 @@ def main() -> None:
     logger = logging.getLogger(__name__)
     logger.info("Starting worker: %s", agent_id)
 
-    preamble = "\n\n".join(
-        open(path, encoding="utf-8").read() for path in args.preamble_file
-    )
+    parts = []
+    for path in args.preamble_file:
+        with open(path, encoding="utf-8") as fh:
+            parts.append(fh.read())
+    preamble = "\n\n".join(parts)
 
     asyncio.run(bridge(
         agent_id=agent_id,
@@ -451,6 +628,10 @@ def main() -> None:
         log_content=args.log_content,
         default_options=default_options,
         allow_task_overrides=args.allow_task_overrides,
+        driver_name=args.driver,
+        ledger_file=args.ledger_file,
+        role=args.role,
+        backend=args.backend,
     ))
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 from fastmcp.dependencies import CurrentHeaders
 
+from .. import ledger
 from ..bridge import validate_task_options
 from ..bus import fold_messages
 from . import broker, config, gitconfig, ratelimit, selfservice, workers, workspace
@@ -82,7 +83,76 @@ async def whoami(headers: dict = _current_headers) -> dict:
         "git_identity": gitconfig.read_identity(tenant),
         "max_workers": tenant.max_workers,
         "workers": await workers.list_units(tenant),
+        # What this week cost, so the question "am I spending anything?" does
+        # not need a second tool call.
+        "usage_7d": await asyncio.to_thread(_usage_7d, tenant),
     }
+
+
+def _usage_7d(tenant) -> dict:
+    recent = ledger.records(tenant.ledger, limit=ledger.MAX_RECORDS, since="7d")
+    summary = ledger.summarize(recent, by="model")
+    return {
+        "tasks": summary["totals"]["tasks"],
+        "cost_usd": summary["totals"]["cost_usd"],
+        "cost_estimated": summary["cost_estimated"],
+        # The ledger keeps a bounded window, so say when the answer is a floor
+        # rather than a total.
+        "truncated": len(recent) >= ledger.MAX_RECORDS,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def task_history(
+    limit: int = 50,
+    since: str | None = None,
+    role: str | None = None,
+    headers: dict = _current_headers,
+) -> dict:
+    """Your most recent finished tasks, newest first.
+
+    One record per task: ids, worker, role, model, effort, exit code, duration,
+    turns, token counts and cost. It holds **metadata only** — never task text,
+    agent output or tool inputs — and it is written whether or not anyone
+    called `collect`, so it is the reliable answer to "what did my fleet do?".
+
+    `since` takes 7d, 24h, 30m, a date (2026-10-28) or an ISO timestamp.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        rows = await asyncio.to_thread(
+            ledger.records, tenant.ledger, limit, since, role)
+    except (TenantError, ValueError) as e:
+        return _fail(e)
+    log.info("user=%s tool=task_history count=%d", tenant.name, len(rows))
+    return {"tasks": rows, "count": len(rows)}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def usage_summary(
+    since: str = "7d",
+    by: str = "model",
+    headers: dict = _current_headers,
+) -> dict:
+    """Aggregate your task ledger: counts, failures, duration percentiles,
+    tokens and cost.
+
+    Group `by` model, role, day, worker, backend or kind. `cost_estimated` is
+    true when any task ran on a subscription credential, where claude reports a
+    notional cost rather than money billed.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        rows = await asyncio.to_thread(
+            ledger.records, tenant.ledger, ledger.MAX_RECORDS, since, None)
+        summary = await asyncio.to_thread(ledger.summarize, rows, by)
+    except (TenantError, ValueError) as e:
+        return _fail(e)
+    summary["since"] = since
+    summary["truncated"] = len(rows) >= ledger.MAX_RECORDS
+    log.info("user=%s tool=usage_summary by=%s tasks=%d",
+             tenant.name, by, summary["totals"]["tasks"])
+    return summary
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True,

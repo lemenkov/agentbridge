@@ -153,9 +153,18 @@ Workers can be given a default model and effort at spawn
 (`spawn_worker(role, model="opus", effort="high")`), and any single task can
 override them (`send_task(..., model="haiku", effort="low")`).
 
+Each finished task appends one metadata line — ids, model, exit code, duration,
+turns, tokens, cost — to a per-user ledger kept **outside** the workspace, so an
+agent cannot edit the record of what it did. `task_history` and `usage_summary`
+read it back, and it is written whether or not anyone calls `collect`. Workers
+run claude through a `stream-json` driver, which is also what makes tool-call
+progress available on `{agent}.progress`.
+
 Tools: `whoami`, `list_roles`, `spawn_worker`, `list_workers`, `send_task`,
 `broadcast`, `collect`, `retire_worker`, `retire_all`, `workspace_ls`,
-`workspace_read`, `workspace_write`, `clone_repo`. Roles, images and mounts are
+`workspace_read`, `workspace_write`, `clone_repo`, `task_history`,
+`usage_summary`, plus `register_credential`, `revoke_credential`,
+`set_password` and `set_git_identity` for your own account. Roles, images and mounts are
 server-side allowlists; no tool argument is a host path, image or flag. Leaves
 use rootless default networking (no `--network=host`), so they cannot reach
 host loopback services.

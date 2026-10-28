@@ -47,6 +47,10 @@ BRIDGE_BIN = os.environ.get(
 # Host path of the native `claude` binary, bind-mounted read-only into leaves.
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "")
 
+# Workers run claude through the stream-json driver, which is what makes
+# per-task metrics and tool progress available. `claude-text` is the fallback.
+AGENT_DRIVER = os.environ.get("AGENT_DRIVER", "claude-stream-json")
+
 IDLE_TIMEOUT = int(os.environ.get("WORKER_IDLE_TIMEOUT", "45"))
 DEFAULT_MAX_WORKERS = int(os.environ.get("DEFAULT_MAX_WORKERS", "4"))
 

@@ -60,6 +60,10 @@ def build_command(
         "--exchange", config.EXCHANGE,
         "--amqp-url-file", str(tenant.amqp_url_file),
         "--idle-timeout", str(config.IDLE_TIMEOUT),
+        "--driver", config.AGENT_DRIVER,
+        # Metadata only, and outside the workspace the agent can write.
+        "--ledger-file", str(tenant.ledger),
+        "--role", role_name,
         # Defaults for this worker; tasks may override them (allowlisted).
         *option_args(options),
         "--allow-task-overrides",

@@ -147,6 +147,22 @@ class WorkerCommand(TenantDirs):
         self.assertNotIn("--model", cmd[podman:])
         self.assertTrue(any("(model=opus effort=high)" in a for a in cmd))
 
+    def test_ledger_and_driver_reach_the_bridge_not_the_agent(self):
+        cmd = self.build()
+        podman = cmd.index("podman")
+        bridge_flags = cmd[:podman]
+        self.assertIn("--driver", bridge_flags)
+        self.assertIn(config.AGENT_DRIVER, bridge_flags)
+        self.assertIn("--role", bridge_flags)
+        self.assertIn("researcher", bridge_flags)
+        self.assertIn("--ledger-file", bridge_flags)
+        # Outside the workspace the agent can write, beside the tenant records.
+        ledger_path = str(config.TENANTS_DIR / "alice.ledger.jsonl")
+        self.assertIn(ledger_path, bridge_flags)
+        self.assertNotIn(str(config.WORKSPACES_DIR), ledger_path)
+        # And none of it is mounted into the leaf or passed to claude.
+        self.assertNotIn(ledger_path, " ".join(cmd[podman:]))
+
     def test_next_index(self):
         ids = ["researcher-1", "researcher-4", "implementer-9"]
         self.assertEqual(workers.next_index(ids, "researcher"), 5)

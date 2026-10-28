@@ -64,6 +64,13 @@ class Tenant:
         return config.TENANTS_DIR / f"{self.name}.gitconfig"
 
     @property
+    def ledger(self) -> Path:
+        """Per-task metadata, deliberately beside the tenant records rather
+        than in the workspace: a read-write agent must not be able to edit the
+        record of what it did."""
+        return config.TENANTS_DIR / f"{self.name}.ledger.jsonl"
+
+    @property
     def workspace(self) -> Path:
         return config.WORKSPACES_DIR / self.name
 
