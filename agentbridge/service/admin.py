@@ -53,12 +53,14 @@ def _service_user() -> pwd.struct_passwd:
         sys.exit(f"service user {name!r} does not exist — run deploy/setup-host.sh first")
 
 
+# cwd="/" on every child: we run as root, often from /root, and the service
+# user cannot chdir there — runuser then fails before the command even starts.
 def _as_service_user(svc: pwd.struct_passwd, *argv: str) -> subprocess.CompletedProcess:
     env = {"PATH": "/usr/bin:/bin", "HOME": svc.pw_dir,
            "XDG_RUNTIME_DIR": f"/run/user/{svc.pw_uid}"}
     return subprocess.run(["runuser", "-u", svc.pw_name, "--", "env",
                            *(f"{k}={v}" for k, v in env.items()), *argv],
-                          text=True, capture_output=True, check=False)
+                          text=True, capture_output=True, check=False, cwd="/")
 
 
 def _secret_runner(svc: pwd.struct_passwd):
@@ -70,7 +72,7 @@ def _secret_runner(svc: pwd.struct_passwd):
         return subprocess.run(
             ["runuser", "-u", svc.pw_name, "--", "env",
              *(f"{k}={v}" for k, v in env.items()), *argv],
-            input=stdin, capture_output=True, check=False,
+            input=stdin, capture_output=True, check=False, cwd="/",
         )
 
     return run
