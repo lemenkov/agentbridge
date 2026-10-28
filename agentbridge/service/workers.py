@@ -11,7 +11,7 @@ import json
 import re
 
 from ..bridge import option_args
-from . import checks, config, workspace
+from . import checkpoint, checks, config, workspace
 from .roles import ROLES, Role
 from .tenant import Tenant
 
@@ -72,6 +72,11 @@ def build_command(
         *option_args(options),
         "--allow-task-overrides",
     ]
+    if role.workspace == "rw":
+        # Only read-write roles can change anything worth undoing, and the
+        # leaf costs about a second per task.
+        cmd += ["--checkpoint-command",
+                json.dumps(checkpoint.checkpoint_command(tenant, role_name))]
     if pool:
         cmd += ["--work-queue", f"{role_name}.work"]
     for path in role.preamble_files:

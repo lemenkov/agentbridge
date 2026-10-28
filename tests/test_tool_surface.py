@@ -27,7 +27,7 @@ USER_TOOLS = {
     "workspace_ls", "workspace_read", "workspace_write", "clone_repo",
     "register_credential", "revoke_credential", "set_password",
     "set_git_identity", "fleet_status", "task_history", "usage_summary",
-    "run_check", "check_result",
+    "run_check", "check_result", "rollback_workspace",
 }
 
 ADMIN_TOOLS = {"provision_user", "deprovision_user", "list_users"}

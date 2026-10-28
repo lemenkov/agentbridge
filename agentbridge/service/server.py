@@ -34,6 +34,9 @@ from . import (
     workers,
     workspace,
 )
+from . import (
+    checkpoint as checkpoint_mod,
+)
 from .roles import ROLES
 from .tenant import (
     TenantError,
@@ -58,7 +61,10 @@ keeping (workspace_write, your own notes) and let the rest go.
 
 Verify with run_check; do not ask an agent whether the tests passed. Loop
 implement -> run_check -> fix, with an explicit stop condition (at most three
-rounds), then escalate to the human rather than looping again."""
+rounds), then escalate to the human rather than looping again.
+
+rollback_workspace undoes a task's commits and is destructive: ask the human
+first, every time, and tell them which task and repository you mean."""
 
 mcp = FastMCP("agentbridge", instructions=INSTRUCTIONS)
 
@@ -233,6 +239,70 @@ async def check_result(
     log.info("user=%s tool=check_result check=%s state=%s rc=%s",
              tenant.name, check_id, result["state"], result["rc"])
     return result
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True,
+                       "openWorldHint": False})
+async def rollback_workspace(
+    task_id: str,
+    repo: str | None = None,
+    force: bool = False,
+    headers: dict = _current_headers,
+) -> dict:
+    """Undo a task's committed work, using the checkpoint taken before it ran.
+
+    **Destructive, and requires the human's approval first** — it discards
+    commits and tracked changes made since the checkpoint. Get that approval
+    before calling it, as the approval policy requires for anything
+    destructive.
+
+    Resets each repository's recorded branch to where it was before `task_id`
+    ran. It never runs `git clean`, so untracked files survive, and it records
+    the discarded tip as `refs/agentbridge/post/<task_id>` so the rollback
+    itself can be undone. A repository that was already dirty when the
+    checkpoint was taken is refused unless `force=True`: those changes were
+    never captured, so resetting would destroy work no checkpoint holds.
+
+    `repo` limits it to one repository (as the checkpoint reported it);
+    omitted, every repository with a checkpoint for that task is rolled back.
+    Only tasks on read-write roles have checkpoints.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        checkpoint_mod.validate_task_id(task_id)
+        target = checkpoint_mod.validate_repo(repo)
+        ratelimit.check(tenant.name, "rollback_workspace")
+    except (TenantError, checkpoint_mod.CheckpointError,
+            ratelimit.RateLimited) as e:
+        return _fail(e)
+
+    try:
+        role = checkpoint_mod.role_for_worker("implementer")
+        argv = checkpoint_mod.rollback_command(
+            tenant, role, task_id, target, force)
+        result = await checkpoint_mod.run_leaf(argv)
+    except checkpoint_mod.CheckpointError as e:
+        return _fail(e)
+
+    repos = result.get("repos") or []
+    if not repos:
+        return _fail(
+            f"no checkpoint found for task {task_id!r} in your workspace — "
+            f"only tasks on read-write roles are checkpointed, and an agent "
+            f"can delete its own refs"
+        )
+    log.info("user=%s tool=rollback_workspace task=%s repos=%d force=%s",
+             tenant.name, task_id, len(repos), force)
+    return {
+        "task_id": task_id,
+        "repos": repos,
+        "rolled_back": [r["repo"] for r in repos
+                        if str(r.get("status", "")).startswith(("reset",
+                                                                "branch_reset"))],
+        "refused": [r["repo"] for r in repos
+                    if r.get("status") == "refused_dirty"],
+        "untracked_files_kept": True,
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})

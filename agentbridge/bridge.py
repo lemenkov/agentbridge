@@ -42,6 +42,12 @@ STREAM_LIMIT = 4 * 1024 * 1024
 # show liveness, not to be a transcript.
 PROGRESS_INTERVAL = 5.0
 
+# The checkpoint leaf does a handful of git commands in a container; a minute
+# is generous. The plan put RuntimeMaxSec=60 on a transient unit, but this
+# leaf is a child of the worker's own unit and so already inside its caps —
+# a nested unit would escape that cgroup's accounting.
+CHECKPOINT_TIMEOUT = 60.0
+
 
 def resolve_amqp_url(
     flag: str | None, path: str | None, environ: Mapping[str, str]
@@ -126,6 +132,7 @@ async def bridge(
     backend: str = "anthropic",
     status_file: str | None = None,
     out_template: str | None = None,
+    checkpoint_command: list[str] | None = None,
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
@@ -184,9 +191,10 @@ async def bridge(
                 "allowed" if allow_task_overrides else "refused")
     logger.info("Driver: %s | role: %s | backend: %s",
                 driver_name, role or "unset", backend)
-    logger.info("Ledger: %s | status file: %s | /out: %s",
+    logger.info("Ledger: %s | status file: %s | /out: %s | checkpoint: %s",
                 ledger_file or "off", status_file or "off",
-                out_template or "off")
+                out_template or "off",
+                "on" if checkpoint_command else "off")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -212,6 +220,39 @@ async def bridge(
         path = Path(out_template.replace("{task_id}", task_id))
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    async def take_checkpoint(task_id: str) -> dict | None:
+        """Run the checkpoint leaf and return what it recorded.
+
+        A checkpoint failure does **not** fail the task. Refusing to work
+        because the safety net could not be hung would trade a small risk for
+        a certain outage; instead the failure is reported in `done` and the
+        journal so the orchestrator knows no rollback is available.
+        """
+        if not checkpoint_command:
+            return None
+        argv = [arg.replace("{task_id}", task_id) for arg in checkpoint_command]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, limit=STREAM_LIMIT,
+            )
+            out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=CHECKPOINT_TIMEOUT)
+        except (TimeoutError, OSError) as exc:
+            logger.warning("Checkpoint for task %s failed: %s", task_id, exc)
+            return {"error": str(exc) or type(exc).__name__}
+        if proc.returncode != 0:
+            detail = err.decode(errors="replace").strip()[-300:]
+            logger.warning("Checkpoint for task %s failed (rc=%d): %s",
+                           task_id, proc.returncode, detail)
+            return {"error": f"checkpoint leaf exited {proc.returncode}",
+                    "detail": detail}
+        try:
+            return json.loads(out.decode(errors="replace") or "{}")
+        except json.JSONDecodeError:
+            logger.warning("Checkpoint for task %s returned no JSON", task_id)
+            return {"error": "checkpoint leaf produced no JSON"}
 
     async def run_task(
         task_text: str, task_id: str | None, options: dict[str, str],
@@ -365,6 +406,12 @@ async def bridge(
         if "expect_ok" in result:
             record["expect_ok"] = result["expect_ok"]
             record["ok"] = result["rc"] == 0 and result["expect_ok"]
+        if "checkpoint" in result:
+            # Whether a rollback is possible for this task, which is the one
+            # thing worth knowing later.
+            checkpoint = result["checkpoint"] or {}
+            record["checkpoint"] = bool(checkpoint.get("repos")) and \
+                "error" not in checkpoint
         try:
             ledger.append(ledger_file, {k: v for k, v in record.items()
                                         if v is not None})
@@ -452,12 +499,17 @@ async def bridge(
                     await publish(progress_key, start_message)
 
                     status.task_started(task_id, options)
+                    # Before the agent runs, so there is something to go
+                    # back to. Costs about a second per read-write task.
+                    checkpoint = await take_checkpoint(task_id) if task_id else None
                     out_dir = task_out_dir(task_id) if task_id else None
                     # The agent is told what it owes before it starts, and the
                     # host checks afterwards; the prompt alone would be a
                     # request, not a guarantee.
                     text = task + expect_mod.prompt_line(declared)
                     result = await run_task(text, task_id, options, out_dir)
+                    if checkpoint is not None:
+                        result["checkpoint"] = checkpoint
                     if declared:
                         statuses = expect_mod.check(
                             out_dir, declared, not_before=started_wall
@@ -511,6 +563,8 @@ async def bridge(
                         done["driver_error"] = result["driver_error"]
                     if "expect" in result:
                         done["expect"] = result["expect"]
+                    if "checkpoint" in result:
+                        done["checkpoint"] = result["checkpoint"]
                     # The single question a caller actually has: did this task
                     # succeed? A zero exit code with a missing declared output
                     # is not a success.
@@ -635,6 +689,17 @@ def main() -> None:
         help="Role name recorded in the ledger (not passed to the agent).",
     )
     parser.add_argument(
+        "--checkpoint-command",
+        default=None,
+        metavar="JSON",
+        help="Command to run before each task, as a JSON array of arguments, "
+             'e.g. \'["podman","run",...]\'. {task_id} is substituted. It '
+             "must print one JSON object describing what it recorded. A JSON "
+             "array rather than a string because there is no shell: the "
+             "service builds the exact argv, and nothing here has to guess "
+             "how to split it.",
+    )
+    parser.add_argument(
         "--out-template",
         default=None,
         metavar="PATH",
@@ -679,6 +744,18 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
+    checkpoint_command = None
+    if args.checkpoint_command:
+        try:
+            checkpoint_command = json.loads(args.checkpoint_command)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--checkpoint-command is not valid JSON: {exc}")
+        if (not isinstance(checkpoint_command, list)
+                or not all(isinstance(a, str) for a in checkpoint_command)
+                or not checkpoint_command):
+            parser.error("--checkpoint-command must be a non-empty JSON array "
+                         "of strings")
+
     agent_id = args.agent or generate_agent_id(args.agent_prefix)
 
     # Set up logging — journald if available, fallback to stderr
@@ -720,6 +797,7 @@ def main() -> None:
         backend=args.backend,
         status_file=args.status_file,
         out_template=args.out_template,
+        checkpoint_command=checkpoint_command,
     ))
 
 

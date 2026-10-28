@@ -153,6 +153,16 @@ Workers can be given a default model and effort at spawn
 (`spawn_worker(role, model="opus", effort="high")`), and any single task can
 override them (`send_task(..., model="haiku", effort="low")`).
 
+Before each task on a read-write role, every git repository in the workspace
+is checkpointed (`refs/agentbridge/pre/<task_id>`), and `rollback_workspace`
+resets the recorded branch back to it. The rollback records the discarded tip
+too, so it can itself be undone, and it never runs `git clean` — untracked
+files survive. All of this git runs **in a leaf**, not on the host: a
+repository's own config can name commands git will execute
+(`core.fsmonitor`, hooks, filter drivers), and a read-write agent can write
+that config, so running git on the host would hand it code execution as the
+service user.
+
 A task can declare what it will produce: `send_task(..., expect=["review.md"])`.
 Every task gets its own directory mounted at `/out` — writable even for a
 read-only role, so a reviewer can deliver a verdict without write access to
