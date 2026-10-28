@@ -280,6 +280,38 @@ class Status(CheckBase):
         self.assertEqual(row["state"], "timeout")
         self.assertIn("timeout", row["note"])
 
+    def test_a_timeout_is_finalized_and_recorded_in_the_ledger(self):
+        # The unit was killed, so it could not write its own verdict; the
+        # first reader to notice does it, exactly once.
+        self.write_result("222222222222", {
+            "state": "running", "rc": None, "role": "reviewer",
+            "started": "2026-10-28T12:00:00+00:00"})
+        row = self.status("222222222222", unit_present=False)
+        self.assertEqual(row["state"], "timeout")
+        self.assertEqual(row["rc"], checks.TIMEOUT_RC)
+
+        entries = ledger.records(self.alice.ledger, limit=5)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "check")
+        self.assertEqual(entries[0]["rc"], checks.TIMEOUT_RC)
+        self.assertEqual(entries[0]["role"], "reviewer")
+        self.assertTrue(entries[0]["timed_out"])
+
+        # Reading again must not append a second row: the rewritten result
+        # file is what makes it idempotent.
+        again = self.status("222222222222", unit_present=False)
+        self.assertEqual(again["state"], "timeout")
+        self.assertEqual(len(ledger.records(self.alice.ledger, limit=5)), 1)
+
+    def test_a_timed_out_check_counts_as_failed(self):
+        self.write_result("333333333333", {
+            "state": "running", "rc": None, "role": "reviewer",
+            "started": "2026-10-28T12:00:00+00:00"})
+        self.status("333333333333", unit_present=False)
+        summary = ledger.summarize(
+            ledger.records(self.alice.ledger, limit=5), by="kind")
+        self.assertEqual(summary["totals"]["failed"], 1)
+
     def test_an_unknown_check_is_a_caller_error(self):
         with self.assertRaises(checks.CheckError):
             self.status("dddddddddddd", False)

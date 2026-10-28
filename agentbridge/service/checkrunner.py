@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     # RuntimeMaxSec (or a reboot) is distinguishable from one never started.
     _write_atomic(args.result, {
         "check_id": args.check_id, "state": "running",
-        "started": started, "rc": None,
+        "started": started, "rc": None, "role": args.role,
     })
 
     rc, error = None, None

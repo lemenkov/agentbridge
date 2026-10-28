@@ -39,6 +39,7 @@ import sys
 import time
 from pathlib import Path
 
+from .. import ledger
 from . import config, workspace
 from .roles import ROLES, Role
 from .tenant import Tenant
@@ -193,6 +194,66 @@ def read_tail(tenant: Tenant, check_id: str, max_bytes: int = TAIL_BYTES) -> dic
     }
 
 
+# `timeout` from coreutils: a check that ran out of time failed, and should
+# count as a failure in usage_summary rather than as a blank.
+TIMEOUT_RC = 124
+
+TERMINAL_STATES = ("done", "timeout")
+
+
+def _finalize_timeout(tenant: Tenant, check_id: str, result: dict) -> dict:
+    """Record a check whose unit died without writing a verdict.
+
+    The unit cannot do this itself — it was killed — so the first reader to
+    notice writes the verdict and the ledger line. Rewriting the result file
+    is what makes it happen once: the next reader sees a finished check.
+    """
+    from datetime import datetime, timezone
+
+    ended = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    duration = None
+    started = result.get("started")
+    if started:
+        try:
+            began = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+            duration = round(
+                (datetime.now(timezone.utc) - began).total_seconds(), 3)
+        except ValueError:
+            duration = None
+
+    payload = {
+        **result,
+        "state": "timeout",
+        "rc": TIMEOUT_RC,
+        "ended": ended,
+        "duration_s": duration,
+        "note": "the check's unit is gone without a result — it hit its "
+                "timeout or was killed",
+    }
+    _, path = _paths(tenant, check_id)
+    temp = path.with_name(f".{path.name}.tmp")
+    try:
+        temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temp.replace(path)
+    except OSError:
+        return payload
+
+    try:
+        ledger.append(tenant.ledger, {
+            "kind": "check",
+            "ts_start": started,
+            "ts_end": ended,
+            "task_id": check_id,
+            "role": result.get("role"),
+            "rc": TIMEOUT_RC,
+            "duration_ms": int(duration * 1000) if duration else None,
+            "timed_out": True,
+        })
+    except OSError:
+        pass
+    return payload
+
+
 def _state_from(tenant: Tenant, check_id: str, unit_present: bool) -> dict:
     """Merge the unit's result file with whether its unit still exists.
 
@@ -202,7 +263,10 @@ def _state_from(tenant: Tenant, check_id: str, unit_present: bool) -> dict:
     """
     result = read_result(tenant, check_id) or {}
     state = result.get("state")
-    if state == "done":
+    # Any terminal state is final. "done" alone is not enough: a finalized
+    # timeout is also terminal, and treating it as unfinished would re-run
+    # the finalisation and append a second ledger row on every read.
+    if state in TERMINAL_STATES:
         return result
     if unit_present:
         return {**result, "state": "running"}
@@ -210,9 +274,7 @@ def _state_from(tenant: Tenant, check_id: str, unit_present: bool) -> dict:
         raise CheckError(
             f"no such check {check_id!r} (or its result has been cleaned up)"
         )
-    return {**result, "state": "timeout", "rc": result.get("rc"),
-            "note": "the check's unit is gone without a result — it hit its "
-                    "timeout or was killed"}
+    return _finalize_timeout(tenant, check_id, result)
 
 
 async def status(
