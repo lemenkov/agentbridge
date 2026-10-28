@@ -23,6 +23,7 @@ from ..bridge import validate_task_options
 from ..bus import fold_messages
 from . import (
     broker,
+    checks,
     config,
     fleet,
     gitconfig,
@@ -52,7 +53,11 @@ done) -> retire_worker. Respond to idle ("waiting") workers with a next task or
 retire them. Implementers commit signed-off on a branch in the workspace and
 never push. Escalate destructive or out-of-scope actions to the human before
 asking an agent to perform them. You are the curator: keep what is worth
-keeping (workspace_write, your own notes) and let the rest go."""
+keeping (workspace_write, your own notes) and let the rest go.
+
+Verify with run_check; do not ask an agent whether the tests passed. Loop
+implement -> run_check -> fix, with an explicit stop condition (at most three
+rounds), then escalate to the human rather than looping again."""
 
 mcp = FastMCP("agentbridge", instructions=INSTRUCTIONS)
 
@@ -72,7 +77,9 @@ async def _credential(tenant):
 
 
 async def _worker_ids(tenant) -> set[str]:
-    return {w["id"] for w in await workers.list_units(tenant)}
+    """Worker ids only: a check shares the unit prefix but takes no tasks."""
+    return {w["id"] for w in await workers.list_units(tenant)
+            if w.get("kind") != "check"}
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
@@ -113,6 +120,118 @@ def _usage_7d(tenant) -> dict:
         # rather than a total.
         "truncated": len(recent) >= ledger.MAX_RECORDS,
     }
+
+
+async def _unit_present(tenant, check_id: str) -> bool:
+    name = checks.unit_name(tenant, check_id)
+    for unit in await workers.list_units(tenant):
+        if unit["unit"] == name:
+            return unit.get("active") in ("active", "activating")
+    return False
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
+                       "openWorldHint": False})
+async def run_check(
+    command: list[str],
+    role: str = "reviewer",
+    workdir: str = ".",
+    timeout: int = 300,
+    wait: float = 60,
+    headers: dict = _current_headers,
+) -> dict:
+    """Run a command against your workspace and report its exit code.
+
+    **Use this instead of asking an agent whether the tests passed.** An agent
+    reporting on its own work is the least reliable witness available. This
+    runs a process and gives you `rc`.
+
+    The container has no credential, no claude binary and `--network=none`, so
+    it cannot reach a model, the broker or a package index — dependencies must
+    be in the role's image. Your workspace is mounted as an overlay: the
+    command may write freely, and every write is discarded, so a check can
+    never change what it is checking.
+
+    `command` is an argv list, e.g. `["pytest", "-q"]`; `["sh", "-c", "a && b"]`
+    is fine, since that shell runs inside the sandbox. It waits up to `wait`
+    seconds and otherwise returns `state: "running"` — poll `check_result`.
+    A check counts against your worker limit while it runs.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        checks.validate_command(command)
+        timeout = checks.validate_timeout(timeout)
+    except (TenantError, checks.CheckError) as e:
+        return _fail(e)
+    if role not in ROLES:
+        return _fail(f"unknown role {role!r}; available: {', '.join(ROLES)}")
+
+    existing = await workers.list_units(tenant)
+    active = [u for u in existing if u["active"] in ("active", "activating")]
+    if len(active) + 1 > tenant.max_workers:
+        return _fail(
+            f"worker limit reached: {len(active)} running (workers and checks "
+            f"share the limit of {tenant.max_workers}); retire something first"
+        )
+
+    check_id = checks.new_check_id()
+    try:
+        argv = await asyncio.to_thread(
+            checks.build_command, tenant, role, check_id, command, workdir, timeout)
+    except (checks.CheckError, WorkspaceError) as e:
+        return _fail(e)
+
+    checks.checks_dir(tenant).mkdir(parents=True, exist_ok=True)
+    try:
+        await workers.start(argv)
+    except RuntimeError as e:
+        return _fail(f"could not start the check: {e}")
+    log.info("user=%s tool=run_check check=%s role=%s timeout=%d",
+             tenant.name, check_id, role, timeout)
+
+    result = await checks.wait_for(
+        tenant, check_id,
+        min(float(wait), config.MAX_COLLECT_SECONDS),
+        lambda: _unit_present(tenant, check_id),
+    )
+    log.info("user=%s tool=run_check check=%s state=%s rc=%s duration=%s",
+             tenant.name, check_id, result["state"], result["rc"],
+             result.get("duration_s"))
+    return result
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def check_result(
+    check_id: str,
+    wait: float = 60,
+    tail_bytes: int = checks.TAIL_BYTES,
+    headers: dict = _current_headers,
+) -> dict:
+    """Poll a check started by `run_check`.
+
+    `state` is `running`, `done`, or `timeout` when the check's unit vanished
+    without recording a result. `rc` of 0 means the command succeeded; `tail`
+    is the end of its combined output, and `log_bytes` says how much there is.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        checks.validate_check_id(check_id)
+    except (TenantError, checks.CheckError) as e:
+        return _fail(e)
+    try:
+        result = await checks.wait_for(
+            tenant, check_id,
+            min(float(wait), config.MAX_COLLECT_SECONDS),
+            lambda: _unit_present(tenant, check_id),
+        )
+        if tail_bytes != checks.TAIL_BYTES:
+            result.update(await asyncio.to_thread(
+                checks.read_tail, tenant, check_id, tail_bytes))
+    except checks.CheckError as e:
+        return _fail(e)
+    log.info("user=%s tool=check_result check=%s state=%s rc=%s",
+             tenant.name, check_id, result["state"], result["rc"])
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
@@ -370,12 +489,17 @@ async def spawn_worker(
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 async def list_workers(headers: dict = _current_headers) -> dict:
-    """List your worker units and their systemd state."""
+    """List your worker units and their systemd state.
+
+    Running checks share the worker budget but are not listed here — see
+    `fleet_status` for those."""
     try:
         tenant = tenant_from_headers(headers)
     except TenantError as e:
         return _fail(e)
-    return {"workers": await workers.list_units(tenant)}
+    units = await workers.list_units(tenant)
+    return {"workers": [u for u in units if u.get("kind") != "check"],
+            "checks_running": sum(1 for u in units if u.get("kind") == "check")}
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,

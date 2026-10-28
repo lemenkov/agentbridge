@@ -16,7 +16,7 @@ import asyncio
 import logging
 
 from .. import ledger, status
-from . import config, rabbit_mgmt
+from . import checks, config, rabbit_mgmt
 from .tenant import Tenant
 
 log = logging.getLogger("mcp-agentbridge")
@@ -126,13 +126,27 @@ async def snapshot(tenant: Tenant, units: list[dict]) -> dict:
         queue_depths(tenant),
         asyncio.to_thread(_usage_7d, tenant),
     )
+    # Checks share the unit prefix and the worker budget, but they are not
+    # workers you can send a task to, so they are reported separately.
+    check_rows = [r for r in rows if checks.is_check(str(r.get("agent", "")))]
+    worker_rows = [r for r in rows if r not in check_rows]
     result = {
         "user": tenant.name,
-        "workers": rows,
+        "workers": worker_rows,
+        "checks_running": [
+            {"check_id": str(r["agent"]).removeprefix(checks.CHECK_PREFIX),
+             "state": r.get("state"), "unit_active": r.get("unit_active")}
+            for r in check_rows
+        ],
         "totals": {
-            "workers": len(rows),
-            "by_state": _totals(rows),
+            "workers": len(worker_rows),
+            "checks": len(check_rows),
+            "by_state": _totals(worker_rows),
+            # Workers and checks draw on one budget, so say so here rather
+            # than letting a caller add up the wrong things.
             "max_workers": tenant.max_workers,
+            "budget_used": len([r for r in rows
+                                if r.get("unit_active") in ("active", "activating")]),
             "usage_7d": usage,
         },
     }

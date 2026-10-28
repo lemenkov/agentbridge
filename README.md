@@ -153,6 +153,15 @@ Workers can be given a default model and effort at spawn
 (`spawn_worker(role, model="opus", effort="high")`), and any single task can
 override them (`send_task(..., model="haiku", effort="low")`).
 
+`run_check` runs a command against the workspace and reports its exit code,
+so nobody has to ask an agent whether the tests passed. Its container gets no
+credential, no `claude` binary and `--network=none`, and the workspace is
+mounted as an overlay — the command may write freely and every write is
+discarded, so a check cannot change what it is checking. Dependencies come
+from the role's image (the promotion rule applies), the log and verdict are
+written outside the workspace, and a check counts against the worker limit
+while it runs.
+
 `fleet_status` answers "what is my fleet doing right now?" in one call —
 per-worker state (`idle`, `working`, `gone`, …), the task and tool in flight,
 queue depths and 7-day usage. There is also a live page for humans at
@@ -171,9 +180,9 @@ progress available on `{agent}.progress`.
 Tools: `whoami`, `list_roles`, `spawn_worker`, `list_workers`, `send_task`,
 `broadcast`, `collect`, `retire_worker`, `retire_all`, `workspace_ls`,
 `workspace_read`, `workspace_write`, `clone_repo`, `fleet_status`,
-`task_history`, `usage_summary`, plus `register_credential`,
-`revoke_credential`, `set_password` and `set_git_identity` for your own
-account. Roles, images and mounts are
+`run_check`, `check_result`, `task_history`, `usage_summary`, plus
+`register_credential`, `revoke_credential`, `set_password` and
+`set_git_identity` for your own account. Roles, images and mounts are
 server-side allowlists; no tool argument is a host path, image or flag. Leaves
 use rootless default networking (no `--network=host`), so they cannot reach
 host loopback services.

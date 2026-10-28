@@ -71,6 +71,13 @@ class Tenant:
         return config.TENANTS_DIR / f"{self.name}.ledger.jsonl"
 
     @property
+    def checks_dir(self) -> Path:
+        """Check logs and results. Outside the workspace on purpose: an
+        implementer can write its workspace, and a check log the subject of
+        the check can rewrite proves nothing."""
+        return config.TENANTS_DIR / f"{self.name}.checks"
+
+    @property
     def status_dir(self) -> Path:
         """One status file per worker, written by its bridge."""
         return config.TENANTS_DIR / f"{self.name}.status"

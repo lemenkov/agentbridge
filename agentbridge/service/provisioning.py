@@ -99,6 +99,8 @@ def provision(name: str, *, max_workers: int | None = None,
     _ensure_dir(tenant.workspace, 0o700, owner)
     # Workers write one status file each in here (fleet_status reads them).
     _ensure_dir(tenant.status_dir, 0o700, owner)
+    # Check logs and results (run_check), likewise outside the workspace.
+    _ensure_dir(tenant.checks_dir, 0o700, owner)
 
     password = None
     if reset_password or not htpasswd.has_entry(name):
@@ -135,6 +137,7 @@ def deprovision(name: str, *, purge: bool = False,
     # Status files and the ledger describe a tenant that no longer exists.
     # The ledger goes only on purge: it is the record of what was spent.
     shutil.rmtree(tenant.status_dir, ignore_errors=True)
+    shutil.rmtree(tenant.checks_dir, ignore_errors=True)
 
     purged = []
     if purge:

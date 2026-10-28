@@ -11,7 +11,7 @@ import json
 import re
 
 from ..bridge import option_args
-from . import config
+from . import checks, config
 from .roles import ROLES, Role
 from .tenant import Tenant
 
@@ -121,11 +121,16 @@ async def list_units(tenant: Tenant) -> list[dict]:
         # Only units with exactly our prefix — never another tenant's.
         if not name.startswith(tenant.unit_prefix) or not name.endswith(".service"):
             continue
+        agent_id = name.removeprefix(tenant.unit_prefix).removesuffix(".service")
         workers.append({
-            "id": name.removeprefix(tenant.unit_prefix).removesuffix(".service"),
+            "id": agent_id,
             "unit": name,
             "active": unit.get("active"),
             "sub": unit.get("sub"),
+            # A check shares the tenant's unit prefix — and so its resource
+            # caps and worker budget — but is not a worker you can send tasks
+            # to. Callers filter on this.
+            "kind": "check" if checks.is_check(agent_id) else "worker",
             "options": _options_from_description(unit.get("description", "")),
         })
     return workers
