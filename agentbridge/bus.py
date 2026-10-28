@@ -86,6 +86,12 @@ def fold_messages(messages: list[dict]) -> list[dict]:
         if kind == "done":
             entry["done"] = True
             entry["rc"] = msg.get("rc")
+            # Carry the driver's per-task figures through the fold: they are
+            # the whole point of `done` now, and a caller that only ever sees
+            # folded results would otherwise never get them.
+            for field in ("metrics", "driver_error"):
+                if field in msg:
+                    entry[field] = msg[field]
             # A later task reusing the same key (e.g. no task_id) starts fresh.
             del open_by_key[key]
         else:

@@ -40,6 +40,19 @@ class FoldMessages(unittest.TestCase):
         [entry] = fold_messages([done("a", "t1", 1)])
         self.assertEqual((entry["body"], entry["rc"]), ("", 1))
 
+    def test_metrics_and_driver_error_survive_the_fold(self):
+        finished = done("a", "t1", 0)
+        finished["metrics"] = {"model": "claude-haiku-5-5", "cost_usd": 0.003}
+        finished["driver_error"] = "1 over-long line dropped"
+        [entry] = fold_messages([finished])
+        self.assertEqual(entry["metrics"]["model"], "claude-haiku-5-5")
+        self.assertEqual(entry["driver_error"], "1 over-long line dropped")
+
+    def test_a_driver_without_metrics_adds_no_keys(self):
+        [entry] = fold_messages([done("a", "t1", 0)])
+        self.assertNotIn("metrics", entry)
+        self.assertNotIn("driver_error", entry)
+
     def test_waiting_passes_through(self):
         msgs = [{"agent_id": "a", "type": "waiting_for_input", "body": "idle"}]
         self.assertEqual(fold_messages(msgs), [{"agent_id": "a", "type": "waiting"}])

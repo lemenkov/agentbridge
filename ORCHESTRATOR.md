@@ -116,11 +116,19 @@ BUS="$AGENTBRIDGE_HOME/venv/bin/agentbus"
 
 `send` declares the destination queue before publishing, so a task is never lost
 if it races a worker's startup. `collect` consumes the shared
-`orchestrator.collect` queue (bound to `*.output` and `*.waiting`). `send` tags
+`orchestrator.collect` queue (bound to `*.output` and `*.waiting` — **not**
+`*.progress`, so progress traffic never competes with results). `send` tags
 each task with a `task_id` (printed; override with `--task-id`); the bridge
 echoes it on every output line and on the `{"type":"done","rc":N}` message it
 publishes when the agent exits, so you can tell which result is which and when
 each task is finished.
+
+With the `stream-json` driver (`--driver claude-stream-json`) the bridge also
+publishes `start` and `progress` messages on `{agent}.progress` — a tool name
+and nothing more, at most one per five seconds — and `done` carries `metrics`
+(model, turns, tokens, cost). Bind your own queue to `*.progress` to watch a
+long task; `collect` is deliberately not bound to it. With `--ledger-file` each
+finished task also appends one metadata line you can read back later.
 
 ## Spawning an Agent
 
@@ -313,6 +321,7 @@ no display, no GPU, no license server. Stick to CLI and compute tooling.
 | Dispatch task to a role pool | `{role}.work` |
 | Receive output from all agents | `*.output` |
 | Receive idle signals | `*.waiting` |
+| Watch task progress (not collected) | `*.progress` |
 | Broadcast to all agents | `orchestrator.broadcast` |
 | Your own inbox | `orchestrator.inbox` |
 
