@@ -130,6 +130,52 @@ class Check(unittest.TestCase):
         self.assertTrue(expect.all_ok({}))
 
 
+class BroadcastRefusesExpect(unittest.IsolatedAsyncioTestCase):
+    """A shared /out with no owner is a false pass waiting to happen."""
+
+    def setUp(self):
+        import json
+        from unittest import mock
+
+        from agentbridge.service import config
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        for patch in (
+            mock.patch.object(config, "TENANTS_DIR", root / "tenants"),
+            mock.patch.object(config, "WORKSPACES_DIR", root / "ws"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        config.TENANTS_DIR.mkdir()
+        (config.TENANTS_DIR / "alice.json").write_text(json.dumps({
+            "vhost": "ab-alice", "bus_user": "ab-alice",
+            "bus_password": "p", "limits": {"max_workers": 2},
+        }))
+        self.headers = {config.USER_HEADER: "alice"}
+
+    async def test_broadcast_refuses_declared_outputs(self):
+        from unittest import mock
+
+        from agentbridge.service import broker, server
+        with mock.patch.object(broker, "publish", new=mock.AsyncMock()) as pub:
+            result = await server.broadcast(
+                "do it", expect=["review.md"], headers=self.headers)
+        self.assertFalse(result["success"])
+        self.assertIn("overwrite", result["error"])
+        # And nothing was sent: a refusal must not half-dispatch.
+        pub.assert_not_called()
+
+    async def test_broadcast_without_expect_still_works(self):
+        from unittest import mock
+
+        from agentbridge.service import broker, server
+        with mock.patch.object(broker, "publish", new=mock.AsyncMock()), \
+             mock.patch.object(broker, "publish_dispatch", new=mock.AsyncMock()):
+            result = await server.broadcast("do it", headers=self.headers)
+        self.assertTrue(result["sent"])
+
+
 class PromptLine(unittest.TestCase):
     def test_nothing_declared_adds_nothing(self):
         self.assertEqual(expect.prompt_line([]), "")

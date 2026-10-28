@@ -565,21 +565,27 @@ async def broadcast(
     headers: dict = _current_headers,
 ) -> dict:
     """Send `body` as a task to every one of your workers at once (optionally
-    overriding model/effort, or declaring outputs, as in send_task).
+    overriding model/effort, as in send_task).
 
-    Every worker runs it under the same task_id, so they share one `/out`
-    directory — declare outputs here only when one answer is wanted, not one
-    per worker."""
+    `expect` is **refused** here: every worker runs a broadcast under the same
+    task_id, so they would share one `/out` directory and silently overwrite
+    each other's file — and the host would report success because *a* valid
+    file exists. To collect a file from each worker, send_task to each one
+    with a distinct name.
+    """
     try:
         tenant = tenant_from_headers(headers)
         options = validate_task_options(model, effort)
-        declared = expect_mod.validate(expect)
-    except (TenantError, ValueError, expect_mod.ExpectError) as e:
+    except (TenantError, ValueError) as e:
         return _fail(e)
+    if expect:
+        return _fail(
+            "broadcast does not accept expect: every worker would write to the "
+            "same /out directory and overwrite the others, and the result would "
+            "look like a success. Use send_task per worker with distinct names."
+        )
     task_id = broker.new_task_id()
     message = {"body": body, "task_id": task_id, **options}
-    if declared:
-        message["expect"] = declared
     await broker.publish(tenant, "orchestrator.broadcast", message)
     await broker.publish_dispatch(tenant, task_id, "orchestrator.broadcast")
     log.info("user=%s tool=broadcast task=%s bytes=%d", tenant.name, task_id,

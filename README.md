@@ -160,7 +160,9 @@ the code it reviewed — and the host checks the declared files after the agent
 exits. A file that is missing, empty, a symlink or left over from an earlier
 run fails the task whatever the agent reported, and `done.ok` is true only when
 the exit code was 0 *and* every declared output passed. `collect` returns the
-files, inline when small.
+files, inline when small. `broadcast` refuses `expect`: its workers share one
+task id, so they would overwrite each other's file and the result would still
+look like a success.
 
 `run_check` runs a command against the workspace and reports its exit code,
 so nobody has to ask an agent whether the tests passed. Its container gets no
