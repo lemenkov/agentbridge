@@ -75,6 +75,9 @@ async def provision_user(
     max_workers: int | None = None,
     admin: bool = False,
     reset_password: bool = False,
+    max_cost_usd: float | None = None,
+    max_tokens: int | None = None,
+    budget_window: str | None = None,
     headers: dict = _current_headers,
 ) -> dict:
     """Create (or update) a tenant: broker vhost and user, records, workspace
@@ -84,6 +87,13 @@ async def provision_user(
     creation, or with reset_password=True. It is stored only as bcrypt, so it
     cannot be shown again. Hand it to its owner over a channel you trust and
     tell them to change it with set_password.
+
+    `max_cost_usd` and `max_tokens` cap what the tenant may spend inside
+    `budget_window` (default 30d); **0 means no limit**, which is the default.
+    They stop new tasks from starting once the line is crossed — they cannot
+    cut a running task short. With a subscription credential the cost figure
+    is the CLI's estimate rather than billing, so prefer the token limit
+    there.
 
     Idempotent: re-running leaves an existing login alone.
     """
@@ -96,6 +106,8 @@ async def provision_user(
         result = await asyncio.to_thread(
             provisioning.provision, name, max_workers=max_workers,
             admin=admin, reset_password=reset_password,
+            max_cost_usd=max_cost_usd, max_tokens=max_tokens,
+            budget_window=budget_window,
         )
     except (TenantError, ratelimit.RateLimited) as e:
         log.info("user=%s tool=provision_user outcome=refused", caller.name)

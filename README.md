@@ -148,10 +148,21 @@ nginx's `X-Forwarded-User` (the Basic-auth user):
 | Credential | podman secret `anthropic-<u>-apikey` (or `-oauth`), injected into that user's containers only |
 | Workspace | `/srv/agentbridge/<u>/`, mounted at `/workspace` (ro or rw by role) |
 | Workers | transient systemd user units `agentbridge-<u>-<role>-<n>`, capped by `MemoryMax`/`CPUQuota`/`TasksMax` |
+| Budget | optional `max_cost_usd` / `max_tokens` per rolling window; **0 = no limit**, the default |
 
 Workers can be given a default model and effort at spawn
 (`spawn_worker(role, model="opus", effort="high")`), and any single task can
 override them (`send_task(..., model="haiku", effort="low")`).
+
+A tenant can be given a spend limit —
+`agentbridge-admin provision <u> --max-cost-usd 5` — enforced over a rolling
+window (30 days by default) from the ledger. Both limits default to **0, which
+means no limit**. They are a brake, not a cap: the check runs before a task is
+dispatched, so the last task admitted can carry the total past the line by its
+own cost, which nothing can know in advance. What they guarantee is that no new
+work starts afterwards. With a subscription credential the cost figure is
+claude's own estimate rather than money billed, so the token limit is the one
+measuring something real there; cache reads are excluded from it.
 
 Before each task on a read-write role, every git repository in the workspace
 is checkpointed (`refs/agentbridge/pre/<task_id>`), and `rollback_workspace`

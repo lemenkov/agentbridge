@@ -127,6 +127,9 @@ def cmd_provision(args: argparse.Namespace) -> None:
             args.user, max_workers=args.max_workers,
             admin=True if args.admin else (False if args.no_admin else None),
             reset_password=args.reset_password,
+            max_cost_usd=args.max_cost_usd,
+            max_tokens=args.max_tokens,
+            budget_window=args.budget_window,
             owner=(svc.pw_uid, svc.pw_gid),
         )
     except (TenantError, provisioning.rabbit_mgmt.RabbitError) as e:
@@ -176,12 +179,21 @@ def cmd_list(args: argparse.Namespace) -> None:
     unit_names = [u.get("unit", "") for u in json.loads(units.stdout or "[]")]
     rows = provisioning.list_tenants(secret_names=secret_names, unit_names=unit_names)
     print(f"{'user':<16} {'credential':<10} {'login':<6} {'admin':<6} "
-          f"{'workers':>7}  {'max':>3}")
+          f"{'workers':>7}  {'max':>3}  {'budget':>18}")
     for row in rows:
+        cost, tokens = row.get("max_cost_usd") or 0, row.get("max_tokens") or 0
+        if cost and tokens:
+            cap = f"${cost:g}/{tokens}tok"
+        elif cost:
+            cap = f"${cost:g}"
+        elif tokens:
+            cap = f"{tokens} tok"
+        else:
+            cap = "unlimited"
         print(f"{row['user']:<16} {','.join(row['credentials']) or '-':<10} "
               f"{('yes' if row['login'] else 'no'):<6} "
               f"{('yes' if row['admin'] else 'no'):<6} "
-              f"{row['workers']:>7}  {row['max_workers'] or '?':>3}")
+              f"{row['workers']:>7}  {row['max_workers'] or '?':>3}  {cap:>18}")
 
 
 def cmd_deprovision(args: argparse.Namespace) -> None:
@@ -219,6 +231,17 @@ def main() -> None:
     p = sub.add_parser("provision", help="create or update a tenant (idempotent)")
     p.add_argument("user")
     p.add_argument("--max-workers", type=int, default=None)
+    p.add_argument("--max-cost-usd", type=float, default=None, metavar="USD",
+                   help="Stop starting tasks once this much has been spent in "
+                        "the budget window. 0 means no limit (the default). "
+                        "With a subscription credential the cost figure is the "
+                        "CLI's estimate, not billing.")
+    p.add_argument("--max-tokens", type=int, default=None, metavar="N",
+                   help="Same, counted in input+output tokens (cache reads "
+                        "excluded). 0 means no limit.")
+    p.add_argument("--budget-window", default=None, metavar="SPEC",
+                   help="Window the limits apply over: 30d, 24h, 7d (default "
+                        "30d).")
     p.add_argument("--git-name", help="committer name for implementer commits")
     p.add_argument("--git-email", help="committer email for implementer commits")
     p.add_argument("--reset-password", action="store_true",

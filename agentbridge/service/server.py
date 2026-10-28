@@ -24,6 +24,7 @@ from ..bridge import validate_task_options
 from ..bus import fold_messages
 from . import (
     broker,
+    budget,
     checks,
     config,
     fleet,
@@ -113,6 +114,8 @@ async def whoami(headers: dict = _current_headers) -> dict:
         # What this week cost, so the question "am I spending anything?" does
         # not need a second tool call.
         "usage_7d": await asyncio.to_thread(_usage_7d, tenant),
+        # Zero limits mean unlimited; `enforced` says whether anything bites.
+        "budget": await asyncio.to_thread(budget.status, tenant),
     }
 
 
@@ -603,7 +606,11 @@ async def send_task(
         tenant = tenant_from_headers(headers)
         options = validate_task_options(model, effort)
         declared = expect_mod.validate(expect)
-    except (TenantError, ValueError, expect_mod.ExpectError) as e:
+        # Checked before dispatch: the limit stops new work starting, it
+        # cannot cap a task already running.
+        await asyncio.to_thread(budget.check, tenant)
+    except (TenantError, ValueError, expect_mod.ExpectError,
+            budget.BudgetExceeded) as e:
         return _fail(e)
     if to.endswith(".inbox"):
         if to.removesuffix(".inbox") not in await _worker_ids(tenant):
@@ -646,7 +653,8 @@ async def broadcast(
     try:
         tenant = tenant_from_headers(headers)
         options = validate_task_options(model, effort)
-    except (TenantError, ValueError) as e:
+        await asyncio.to_thread(budget.check, tenant)
+    except (TenantError, ValueError, budget.BudgetExceeded) as e:
         return _fail(e)
     if expect:
         return _fail(

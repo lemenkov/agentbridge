@@ -57,6 +57,8 @@ def _ensure_dir(path: Path, mode: int, owner: Owner = None) -> None:
 
 def provision(name: str, *, max_workers: int | None = None,
               admin: bool | None = None, reset_password: bool = False,
+              max_cost_usd: float | None = None, max_tokens: int | None = None,
+              budget_window: str | None = None,
               owner: Owner = None) -> dict:
     """Create or update a tenant. Idempotent, and safe to re-run.
 
@@ -72,6 +74,11 @@ def provision(name: str, *, max_workers: int | None = None,
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if max_workers is not None:
             record.setdefault("limits", {})["max_workers"] = max_workers
+        for key, value in (("max_cost_usd", max_cost_usd),
+                           ("max_tokens", max_tokens),
+                           ("budget_window", budget_window)):
+            if value is not None:
+                record.setdefault("limits", {})[key] = value
         if admin is not None:
             record["admin"] = admin
     else:
@@ -80,7 +87,15 @@ def provision(name: str, *, max_workers: int | None = None,
             "bus_user": f"ab-{name}",
             "bus_password": _secrets.token_hex(24),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "limits": {"max_workers": max_workers or config.DEFAULT_MAX_WORKERS},
+            "limits": {
+                "max_workers": max_workers or config.DEFAULT_MAX_WORKERS,
+                # Zero means no limit, and that is the default.
+                "max_cost_usd": (config.DEFAULT_MAX_COST_USD
+                                 if max_cost_usd is None else max_cost_usd),
+                "max_tokens": (config.DEFAULT_MAX_TOKENS
+                               if max_tokens is None else max_tokens),
+                "budget_window": budget_window or config.BUDGET_WINDOW,
+            },
             "admin": bool(admin),
         }
     tenant = Tenant(
@@ -113,6 +128,9 @@ def provision(name: str, *, max_workers: int | None = None,
         "bus_user": tenant.bus_user,
         "workspace": str(tenant.workspace),
         "max_workers": tenant.max_workers,
+        "max_cost_usd": tenant.max_cost_usd,
+        "max_tokens": tenant.max_tokens,
+        "budget_window": tenant.budget_window,
         "admin": tenant.admin,
         "password": password,
         "has_git_identity": tenant.gitconfig.exists(),
@@ -177,6 +195,8 @@ def list_tenants(*, secret_names: set[str] | None = None,
             "user": name,
             "admin": bool(record.get("admin", False)),
             "max_workers": record.get("limits", {}).get("max_workers"),
+            "max_cost_usd": record.get("limits", {}).get("max_cost_usd", 0),
+            "max_tokens": record.get("limits", {}).get("max_tokens", 0),
             "created": record.get("created"),
             "credentials": [kind for kind, _ in CREDENTIAL_KINDS
                             if f"anthropic-{name}-{kind}" in secret_names],

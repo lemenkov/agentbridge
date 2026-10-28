@@ -45,6 +45,10 @@ class Tenant:
     bus_user: str
     bus_password: str
     max_workers: int
+    # Zero means no limit (see service/budget.py).
+    max_cost_usd: float = 0.0
+    max_tokens: int = 0
+    budget_window: str = "30d"
     # Admin tools are refused unless this is set in the tenant record. nginx
     # cannot tell admins apart — it only knows logins — so the service decides.
     admin: bool = False
@@ -112,13 +116,17 @@ def load_tenant(name: str) -> Tenant:
             f"user {name!r} is not provisioned on this service — ask the "
             f"operator to run `agentbridge-admin provision {name}`"
         ) from None
+    limits = record.get("limits", {}) or {}
     return Tenant(
         name=name,
         vhost=record["vhost"],
         bus_user=record["bus_user"],
         bus_password=record["bus_password"],
-        max_workers=int(record.get("limits", {}).get(
-            "max_workers", config.DEFAULT_MAX_WORKERS)),
+        max_workers=int(limits.get("max_workers", config.DEFAULT_MAX_WORKERS)),
+        max_cost_usd=float(limits.get("max_cost_usd",
+                                      config.DEFAULT_MAX_COST_USD)),
+        max_tokens=int(limits.get("max_tokens", config.DEFAULT_MAX_TOKENS)),
+        budget_window=str(limits.get("budget_window", config.BUDGET_WINDOW)),
         admin=bool(record.get("admin", False)),
     )
 

@@ -54,6 +54,13 @@ AGENT_DRIVER = os.environ.get("AGENT_DRIVER", "claude-stream-json")
 IDLE_TIMEOUT = int(os.environ.get("WORKER_IDLE_TIMEOUT", "45"))
 DEFAULT_MAX_WORKERS = int(os.environ.get("DEFAULT_MAX_WORKERS", "4"))
 
+# Spend limits, per tenant, over BUDGET_WINDOW. Zero means no limit, which is
+# the default: a limit that appears without anyone asking for it would stop a
+# fleet mid-run on a host where nobody had decided on a budget.
+DEFAULT_MAX_COST_USD = float(os.environ.get("DEFAULT_MAX_COST_USD", "0"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("DEFAULT_MAX_TOKENS", "0"))
+BUDGET_WINDOW = os.environ.get("BUDGET_WINDOW", "30d")
+
 # Generic per-worker resource caps, enforced by systemd on the worker unit (the
 # containers run inside it via podman --cgroups=split).
 WORKER_MEMORY_MAX = os.environ.get("WORKER_MEMORY_MAX", "3G")

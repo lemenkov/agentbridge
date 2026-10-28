@@ -49,6 +49,16 @@ WORKER_TASKS_MAX=512
 WORKER_IDLE_TIMEOUT=45
 DEFAULT_MAX_WORKERS=4
 
+# Spend limits for new tenants, over BUDGET_WINDOW. 0 means no limit, which is
+# the default. They stop new tasks starting once the line is crossed; they
+# cannot cut short a task already running. With a subscription credential the
+# cost figure is claude's estimate rather than billing, so the token limit is
+# the one that measures something real there. Per-tenant values override these:
+#   agentbridge-admin provision <u> --max-cost-usd 5 --max-tokens 0
+DEFAULT_MAX_COST_USD=0
+DEFAULT_MAX_TOKENS=0
+BUDGET_WINDOW=30d
+
 MAX_COLLECT_SECONDS=120
 INLINE_MAX_BYTES=4096
 WORKSPACE_READ_MAX=262144
