@@ -51,6 +51,18 @@ function svgEl(tag, attrs) {
   return node;
 }
 
+// The page may have been opened with credentials in the URL — the
+// "user:pass@host" form — in which case document.baseURI carries them.
+// fetch() REFUSES such a URL outright, so a relative fetch silently never
+// happens; and anything that logs or displays the URL would be echoing the
+// password. Strip the userinfo before either can occur.
+function sameOrigin(path) {
+  const url = new URL(path, document.baseURI);
+  url.username = "";
+  url.password = "";
+  return url;
+}
+
 function parseTs(value) {
   if (!value) return null;
   const ms = Date.parse(value);
@@ -392,29 +404,30 @@ function setConnection(label, stateName) {
 }
 
 async function refreshSnapshot() {
-  // The URL is built from the document's own location rather than left as a
-  // bare relative string, so it cannot depend on how the page was reached
-  // (with or without the trailing slash, via a redirect, or through a proxy
-  // that rewrote the path).
-  const url = new URL("snapshot.json", document.baseURI).href;
+  // Built from the document's own base, so it cannot depend on how the page
+  // was reached: trailing slash or not, via a redirect, or behind a proxy
+  // that rewrote the path.
+  const url = sameOrigin("snapshot.json");
   try {
-    const response = await fetch(url, {headers: {Accept: "application/json"}});
+    const response = await fetch(url.href, {headers: {Accept: "application/json"}});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     applySnapshot(await response.json());
     // Reported on the page itself: a silent failure here leaves the recent
     // tasks table stale while everything else looks healthy, and diagnosing
-    // that should not require opening DevTools.
-    noteEvent("snapshot", {to: url, phase: "ok"});
+    // that should not require opening DevTools. The PATH only — a URL could
+    // carry credentials, and this log is read, copied and pasted.
+    noteEvent("snapshot", {phase: "ok"});
   } catch (err) {
     setConnection("snapshot failed", "lost");
-    noteEvent("snapshot", {to: url, error: String(err && err.message || err)});
+    noteEvent("snapshot", {to: url.pathname,
+                           error: String((err && err.message) || err)});
   }
 }
 
 function connect() {
   if (source) source.close();
   const bodies = document.getElementById("bodies").checked;
-  source = new EventSource(bodies ? "events?bodies=1" : "events");
+  source = new EventSource(sameOrigin(bodies ? "events?bodies=1" : "events").href);
 
   source.addEventListener("open", () => setConnection("live", "live"));
   source.addEventListener("snapshot", (e) => {

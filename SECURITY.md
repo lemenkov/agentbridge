@@ -190,6 +190,19 @@ repository or a web page.
 - Grant `--admin` to as few tenants as possible, and remember that an admin can
   deprovision every tenant but themselves.
 
+### L7. Credentials in a URL
+
+The fleet page is behind HTTP Basic auth, which makes the
+`user:password@host` URL form tempting. Do not use it. Such a URL is kept by
+the browser in history, in `document.baseURI`, and in anything that logs or
+displays a URL; `fetch()` refuses it outright, so parts of the page silently
+stop working. The page strips the userinfo from every URL it builds and never
+logs a whole URL, but it cannot unsee a password the browser was handed. Let
+the browser prompt for the credential, or use a password manager.
+
+A credential that has been in a URL should be treated as disclosed and
+rotated: `agentbridge-admin provision <user> --reset-password`.
+
 ## Reporting
 
 Report a vulnerability privately to the maintainer

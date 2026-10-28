@@ -61,6 +61,22 @@ class Assets(unittest.TestCase):
         self.assertNotRegex(self.js, r"\beval\s*\(")
         self.assertNotRegex(self.js, r"new\s+Function\s*\(")
 
+    def test_urls_are_built_with_credentials_stripped(self):
+        # A page opened as https://user:pass@host/... carries the userinfo in
+        # document.baseURI. fetch() refuses such a URL outright, and anything
+        # that logs it echoes the password.
+        self.assertIn('url.username = ""', self.js)
+        self.assertIn('url.password = ""', self.js)
+        # Every network call goes through the helper, none through a bare
+        # relative string.
+        self.assertNotRegex(self.js, r'fetch\(\s*"')
+        self.assertNotRegex(self.js, r'new EventSource\(\s*(?!sameOrigin)')
+
+    def test_the_event_log_never_records_a_whole_url(self):
+        # Logging url.href would put a credential into a log people copy and
+        # paste; the path is enough to diagnose with.
+        self.assertNotRegex(self.js, r'noteEvent\([^)]*to:\s*url\b(?!\.pathname)')
+
     def test_agent_strings_go_through_textcontent(self):
         # The helper that builds every node assigns textContent, and the page
         # uses it for tool names, bodies and task ids.
