@@ -25,6 +25,14 @@ CREDENTIAL_KINDS = (
     ("oauth", "CLAUDE_CODE_OAUTH_TOKEN"),
 )
 
+# A credential's kind is decided by its prefix, and nothing else: guessing
+# ("not an API key, so presumably OAuth") would store a typo under a name the
+# worker then exports as a token, and the failure would surface much later.
+CREDENTIAL_PREFIXES = (
+    ("sk-ant-api", "apikey"),
+    ("sk-ant-oat", "oauth"),
+)
+
 
 class TenantError(Exception):
     """A caller-fixable problem resolving the tenant (reported, not raised)."""
@@ -113,6 +121,22 @@ async def podman_secret_names() -> set[str]:
     if proc.returncode != 0:
         raise RuntimeError(f"podman secret ls failed: {err.decode().strip()}")
     return set(out.decode().split())
+
+
+def credential_kind(token: str) -> str:
+    """``apikey`` or ``oauth``, from the token's prefix.
+
+    The error names the prefixes but never the value, not even its length:
+    length alone distinguishes the kinds.
+    """
+    for prefix, kind in CREDENTIAL_PREFIXES:
+        if (token or "").startswith(prefix):
+            return kind
+    raise TenantError(
+        "unrecognised credential: expected an Anthropic API key "
+        f"({CREDENTIAL_PREFIXES[0][0]}…) or an OAuth token "
+        f"({CREDENTIAL_PREFIXES[1][0]}…); nothing was stored"
+    )
 
 
 def pick_credential(tenant: Tenant, secret_names: set[str]) -> tuple[str, str] | None:

@@ -19,7 +19,7 @@ from fastmcp.dependencies import CurrentHeaders
 
 from ..bridge import validate_task_options
 from ..bus import fold_messages
-from . import broker, config, workers, workspace
+from . import broker, config, gitconfig, ratelimit, selfservice, workers, workspace
 from .roles import ROLES
 from .tenant import (
     TenantError,
@@ -76,9 +76,103 @@ async def whoami(headers: dict = _current_headers) -> dict:
         "workspace": str(tenant.workspace),
         "credential_registered": credential is not None,
         "credential_kind": credential[1] if credential else None,
+        # So a caller can tell why an implementer cannot commit, without
+        # having to guess (set it with set_git_identity).
+        "git_identity": gitconfig.read_identity(tenant),
         "max_workers": tenant.max_workers,
         "workers": await workers.list_units(tenant),
     }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True,
+                       "openWorldHint": False})
+async def register_credential(token: str, headers: dict = _current_headers) -> dict:
+    """Register your own Anthropic credential, which your workers run under.
+
+    Pass an API key (`sk-ant-api…`) or a Claude Code OAuth token
+    (`sk-ant-oat…`); the kind is taken from the prefix. It is stored as a
+    podman secret of the service user and replaces any previous one of that
+    kind. It is never logged or echoed back.
+
+    Note what this costs: the value passes through this conversation and
+    Anthropic's connector relay on its way here. Prefer a dedicated,
+    spend-capped key you can revoke on its own.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    try:
+        ratelimit.check(tenant.name, "register_credential")
+        result = await selfservice.register_credential(tenant, token)
+    except (TenantError, ratelimit.RateLimited) as e:
+        log.info("user=%s tool=register_credential outcome=refused", tenant.name)
+        return _fail(e)
+    log.info("user=%s tool=register_credential outcome=stored kind=%s",
+             tenant.name, result["registered"])
+    return result
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True,
+                       "openWorldHint": False})
+async def revoke_credential(kind: str, headers: dict = _current_headers) -> dict:
+    """Delete one of your stored credentials (`apikey` or `oauth`). Workers
+    already running keep theirs until they retire."""
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    try:
+        result = await selfservice.revoke_credential(tenant, kind)
+    except TenantError as e:
+        log.info("user=%s tool=revoke_credential outcome=refused", tenant.name)
+        return _fail(e)
+    log.info("user=%s tool=revoke_credential outcome=revoked kind=%s existed=%s",
+             tenant.name, kind, result["existed"])
+    return result
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True,
+                       "openWorldHint": False})
+async def set_password(new_password: str, headers: dict = _current_headers) -> dict:
+    """Change your own login password for this service's endpoint.
+
+    At least 12 characters. It is stored only as a bcrypt hash, and takes
+    effect immediately — so update the connector's saved credential right
+    after, or your next call will fail to authenticate.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    try:
+        ratelimit.check(tenant.name, "set_password")
+        result = await selfservice.set_password(tenant, new_password)
+    except (TenantError, ratelimit.RateLimited) as e:
+        log.info("user=%s tool=set_password outcome=refused", tenant.name)
+        return _fail(e)
+    log.info("user=%s tool=set_password outcome=updated", tenant.name)
+    return result
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
+                       "openWorldHint": False})
+async def set_git_identity(
+    name: str, email: str, headers: dict = _current_headers
+) -> dict:
+    """Set the committer identity your implementer agents sign off commits
+    with. Without one they cannot commit at all."""
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    try:
+        result = await selfservice.set_git_identity(tenant, name, email)
+    except TenantError as e:
+        log.info("user=%s tool=set_git_identity outcome=refused", tenant.name)
+        return _fail(e)
+    log.info("user=%s tool=set_git_identity outcome=updated", tenant.name)
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
