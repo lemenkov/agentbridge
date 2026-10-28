@@ -392,12 +392,22 @@ function setConnection(label, stateName) {
 }
 
 async function refreshSnapshot() {
+  // The URL is built from the document's own location rather than left as a
+  // bare relative string, so it cannot depend on how the page was reached
+  // (with or without the trailing slash, via a redirect, or through a proxy
+  // that rewrote the path).
+  const url = new URL("snapshot.json", document.baseURI).href;
   try {
-    const response = await fetch("snapshot.json", {headers: {Accept: "application/json"}});
-    if (!response.ok) throw new Error(`snapshot ${response.status}`);
+    const response = await fetch(url, {headers: {Accept: "application/json"}});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     applySnapshot(await response.json());
+    // Reported on the page itself: a silent failure here leaves the recent
+    // tasks table stale while everything else looks healthy, and diagnosing
+    // that should not require opening DevTools.
+    noteEvent("snapshot", {to: url, phase: "ok"});
   } catch (err) {
     setConnection("snapshot failed", "lost");
+    noteEvent("snapshot", {to: url, error: String(err && err.message || err)});
   }
 }
 
