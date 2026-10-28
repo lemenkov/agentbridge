@@ -165,6 +165,76 @@ def cmd_provision(args: argparse.Namespace) -> None:
           f"# or -oauth; value on stdin")
 
 
+def cmd_git_token(args: argparse.Namespace) -> None:
+    """Register a forge token, read from stdin.
+
+    From stdin and not an argument, for two reasons: argv is world-readable in
+    ``ps`` while the process runs, and a value typed on a command line lands in
+    the shell's history. Neither is true of a pipe. This is also why there is
+    no MCP tool for it — a tool argument is recorded in a conversation.
+    """
+    from . import gitcred
+    from .tenant import TenantError, load_tenant
+
+    svc = _service_user()
+    if sys.stdin.isatty():
+        print("Paste the token, then press Enter (it is not echoed back):",
+              file=sys.stderr)
+        import getpass
+        token = getpass.getpass("")
+    else:
+        token = sys.stdin.readline()
+
+    try:
+        tenant = load_tenant(args.user)
+        entry = gitcred.add_token(
+            tenant, args.host, args.match, token, scope=args.scope,
+            owner=(svc.pw_uid, svc.pw_gid),
+        )
+    except (TenantError, gitcred.GitCredError) as e:
+        sys.exit(str(e))
+    print(f"registered {entry['id']}: {entry['token_kind']} for "
+          f"{entry['host']}/{entry['match']} ({entry['scope']})")
+    if entry["match"].endswith("/*"):
+        print("note: this token is offered for every repository of that owner; "
+              "a per-repository match is narrower", file=sys.stderr)
+    if entry["scope"] == "write":
+        print("note: write credentials are not used by clone_repo or "
+              "fetch_repo, only by a tool that asks the human", file=sys.stderr)
+
+
+def cmd_git_token_list(args: argparse.Namespace) -> None:
+    from . import gitcred
+    from .tenant import TenantError, load_tenant
+
+    try:
+        entries = gitcred.list_credentials(load_tenant(args.user))
+    except TenantError as e:
+        sys.exit(str(e))
+    if not entries:
+        print("no git credentials")
+        return
+    print(f"{'id':<40} {'host':<16} {'match':<28} {'scope':<6} kind")
+    for e in entries:
+        print(f"{e['id']:<40} {e['host']:<16} {e['match']:<28} "
+              f"{e.get('scope', 'read'):<6} {e.get('token_kind', '?')}")
+
+
+def cmd_git_token_remove(args: argparse.Namespace) -> None:
+    from . import gitcred
+    from .tenant import TenantError, load_tenant
+
+    try:
+        gone = gitcred.remove(load_tenant(args.user), args.id)
+    except TenantError as e:
+        sys.exit(str(e))
+    if not gone:
+        sys.exit(f"no credential {args.id!r} for {args.user!r}")
+    print(f"removed {args.id}")
+    print("remember to revoke it at the forge too — deleting it here only "
+          "stops this service from using it", file=sys.stderr)
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     from . import provisioning
     from . import secrets as secrets_mod
@@ -254,6 +324,29 @@ def main() -> None:
 
     p = sub.add_parser("list", help="list tenants, credentials and worker counts")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("git-token",
+                       help="register a forge token for a tenant (from stdin)")
+    p.add_argument("user")
+    p.add_argument("--host", required=True,
+                   help="forge host, e.g. github.com")
+    p.add_argument("--match", required=True, metavar="OWNER/NAME",
+                   help="repository the token is for; OWNER/* is allowed but "
+                        "broader than it needs to be")
+    p.add_argument("--scope", default="read", choices=["read", "write"],
+                   help="read (default) is usable by clone_repo and "
+                        "fetch_repo; write is reachable only from a tool that "
+                        "asks the human first")
+    p.set_defaults(func=cmd_git_token)
+
+    p = sub.add_parser("git-token-list", help="list a tenant's git credentials")
+    p.add_argument("user")
+    p.set_defaults(func=cmd_git_token_list)
+
+    p = sub.add_parser("git-token-remove", help="delete one git credential")
+    p.add_argument("user")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_git_token_remove)
 
     p = sub.add_parser("deprovision", help="stop workers, delete vhost and bus user")
     p.add_argument("user")

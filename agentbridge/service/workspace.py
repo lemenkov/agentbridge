@@ -84,14 +84,20 @@ def new_outbox_token() -> str:
     return secrets.token_hex(8)
 
 
-async def clone(tenant: Tenant, url: str, dest: str) -> dict:
-    """``git clone`` an https repository into the workspace, on the host."""
+async def clone(tenant: Tenant, url: str, dest: str,
+                env: dict | None = None) -> dict:
+    """``git clone`` an https repository into the workspace, on the host.
+
+    ``env`` carries a git credential when one is registered for this
+    repository (see service/gitcred.py); the secret is in the environment of
+    this one child process, never in argv or the URL.
+    """
     if not url.startswith("https://"):
         raise WorkspaceError("only https:// repository URLs are accepted")
     target = resolve(tenant, dest)
     if target.exists():
         raise WorkspaceError(f"destination {dest!r} already exists")
-    env = {
+    env = env or {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tenant.workspace),
         "GIT_TERMINAL_PROMPT": "0",
@@ -110,4 +116,28 @@ async def clone(tenant: Tenant, url: str, dest: str) -> dict:
         raise WorkspaceError(f"git clone timed out after {config.CLONE_TIMEOUT}s") from None
     if proc.returncode != 0:
         raise WorkspaceError(f"git clone failed: {err.decode(errors='replace').strip()[-500:]}")
-    return {"cloned": url, "dest": dest}
+    # The workspace is mounted into leaves, so a credential left in
+    # .git/config would be readable by every agent. Nothing here puts one
+    # there, which is exactly why it is worth checking before an agent can
+    # look: a silent regression would hand the token over.
+    leaked = await _scrub_origin(target, url)
+    return {"cloned": url, "dest": dest, **({"repaired": leaked} if leaked else {})}
+
+
+async def _scrub_origin(target: Path, url: str) -> bool:
+    """Ensure remote.origin.url carries no userinfo. Returns True if it did."""
+    config_path = target / ".git" / "config"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if "@" not in text.split("url = ", 1)[-1].split("\n", 1)[0]:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", str(target), "remote", "set-url", "origin", url,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+             "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    await proc.wait()
+    return True

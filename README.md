@@ -164,6 +164,23 @@ work starts afterwards. With a subscription credential the cost figure is
 claude's own estimate rather than money billed, so the token limit is the one
 measuring something real there; cache reads are excluded from it.
 
+**Private repositories.** Register a fine-grained forge token per tenant and
+`clone_repo` uses it automatically:
+
+```bash
+agentbridge-admin git-token add <u> --host github.com --match owner/name
+# reads the token from stdin; --scope write exists but nothing uses it yet
+```
+
+It is a root CLI command reading stdin, not an MCP tool, on purpose: a tool
+argument would be recorded in the conversation that called it. The token stays
+on the host — never a container, never argv, never the clone URL (where it
+would persist in `.git/config` for every agent to read) — and is passed per
+git invocation through `GIT_CONFIG_*`. `list_git_credentials` and
+`test_git_credential` let a tenant see and check what they have without ever
+seeing a value. Read and write are separate credentials: `clone_repo` can only
+use a read one.
+
 Before each task on a read-write role, every git repository in the workspace
 is checkpointed (`refs/agentbridge/pre/<task_id>`), and `rollback_workspace`
 resets the recorded branch back to it. The rollback records the discarded tip

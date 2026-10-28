@@ -164,6 +164,10 @@ def deprovision(name: str, *, purge: bool = False,
     # The ledger goes only on purge: it is the record of what was spent.
     shutil.rmtree(tenant.status_dir, ignore_errors=True)
     shutil.rmtree(tenant.checks_dir, ignore_errors=True)
+    # Git credentials go with the tenant: they are useless without it, and
+    # leaving tokens on disk after a tenant is gone is how a forgotten secret
+    # outlives everything that could justify it.
+    shutil.rmtree(config.TENANTS_DIR / f"{tenant.name}.git", ignore_errors=True)
 
     purged = []
     if purge:

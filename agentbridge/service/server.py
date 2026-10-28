@@ -29,6 +29,7 @@ from . import (
     config,
     fleet,
     gitconfig,
+    gitcred,
     ratelimit,
     selfservice,
     ui,
@@ -858,14 +859,86 @@ async def workspace_write(path: str, text: str, headers: dict = _current_headers
                        "openWorldHint": True})
 async def clone_repo(url: str, dest: str, headers: dict = _current_headers) -> dict:
     """Clone an https:// git repository into `dest` inside your workspace, so
-    agents can work on it at /workspace/<dest>."""
+    agents can work on it at /workspace/<dest>.
+
+    A private repository works if a read credential is registered for it (see
+    list_git_credentials); otherwise the clone is anonymous. The credential
+    stays on the host: it is never written into the repository's config and
+    never reaches a container.
+    """
     try:
         tenant = tenant_from_headers(headers)
-        result = await workspace.clone(tenant, url, dest)
-    except (TenantError, WorkspaceError) as e:
+        host, repo = gitcred.parse_url(url)
+        entry = gitcred.select(tenant, host, repo, scope="read")
+        env = gitcred.git_env(tenant, entry)
+        result = await workspace.clone(tenant, url, dest, env=env)
+    except (TenantError, WorkspaceError, gitcred.GitCredError) as e:
         return _fail(e)
-    log.info("user=%s tool=clone_repo", tenant.name)
-    return result
+    log.info("user=%s tool=clone_repo host=%s repo=%s %s", tenant.name, host,
+             repo, gitcred.safe_log_fields(entry))
+    if result.get("repaired"):
+        log.warning("user=%s tool=clone_repo repaired a credential in "
+                    "remote.origin.url", tenant.name)
+    return {**result, "authenticated": entry is not None,
+            **gitcred.safe_log_fields(entry)}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def list_git_credentials(headers: dict = _current_headers) -> dict:
+    """The git credentials registered for you: host, which repositories they
+    match, and whether they are read or write. Never a token value.
+
+    Registering one is the operator's job, deliberately: a token passed as a
+    tool argument would be recorded in this conversation. Ask them to run
+    `agentbridge-admin git-token add <you> --host github.com --match owner/name`.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    entries = await asyncio.to_thread(gitcred.list_credentials, tenant)
+    log.info("user=%s tool=list_git_credentials count=%d", tenant.name,
+             len(entries))
+    return {"credentials": entries,
+            "hosts_allowed": list(gitcred.ALLOWED_HOSTS)}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def test_git_credential(
+    repo_url: str, headers: dict = _current_headers
+) -> dict:
+    """Check that a repository can be reached with the credential that would
+    be used for it — `git ls-remote`, which fetches no objects.
+
+    Use this before `clone_repo` on a private repository, so a failure is a
+    clear "the token cannot see it" rather than a confusing clone error.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        host, repo = gitcred.parse_url(repo_url)
+        entry = gitcred.select(tenant, host, repo, scope="read")
+        env = gitcred.git_env(tenant, entry)
+    except (TenantError, gitcred.GitCredError) as e:
+        return _fail(e)
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+        "ls-remote", "--heads", "--", f"https://{host}/{repo}.git",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except TimeoutError:
+        proc.kill()
+        return _fail("git ls-remote timed out after 30s")
+    fields = gitcred.safe_log_fields(entry)
+    log.info("user=%s tool=test_git_credential host=%s repo=%s rc=%s %s",
+             tenant.name, host, repo, proc.returncode, fields)
+    if proc.returncode != 0:
+        # stderr from git can echo the URL but never the header we set.
+        return {"success": False, "repo": f"{host}/{repo}", **fields,
+                "error": err.decode(errors="replace").strip()[-400:]}
+    return {"ok": True, "repo": f"{host}/{repo}", **fields,
+            "branches": len([ln for ln in out.decode().splitlines() if ln.strip()])}
 
 
 async def _serve_both(host: str, port: int, admin_port: int) -> None:
