@@ -34,6 +34,9 @@ class BudgetBase(unittest.TestCase):
         for patch in (
             mock.patch.object(config, "TENANTS_DIR", root / "tenants"),
             mock.patch.object(config, "WORKSPACES_DIR", root / "ws"),
+            # Must be redirected too: provisioning writes a login, and the
+            # real file belongs to the service user.
+            mock.patch.object(config, "HTPASSWD_FILE", root / "htpasswd" / "users"),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -171,6 +174,43 @@ class Honesty(BudgetBase):
         ledger.append(tenant.ledger, {"kind": "task", "rc": 0,
                                       "ts_end": stamp()})
         self.assertEqual(budget.check(tenant)["cost_usd"], 0.0)
+
+
+class ProvisionReportsWhatItStored(BudgetBase):
+    """The return value must not report defaults for fields it just set."""
+
+    def test_limits_come_back_as_stored(self):
+        from agentbridge.service import provisioning, rabbit_mgmt
+        with mock.patch.object(rabbit_mgmt, "ensure_tenant"):
+            created = provisioning.provision("alice", max_cost_usd=2.5,
+                                             max_tokens=1000,
+                                             budget_window="7d")
+        self.assertEqual(created["max_cost_usd"], 2.5)
+        self.assertEqual(created["max_tokens"], 1000)
+        self.assertEqual(created["budget_window"], "7d")
+
+    def test_updating_one_limit_reports_the_others_unchanged(self):
+        from agentbridge.service import provisioning, rabbit_mgmt
+        with mock.patch.object(rabbit_mgmt, "ensure_tenant"):
+            provisioning.provision("alice", max_cost_usd=2.5, max_tokens=1000)
+            updated = provisioning.provision("alice", max_cost_usd=5.0)
+        self.assertEqual(updated["max_cost_usd"], 5.0)
+        self.assertEqual(updated["max_tokens"], 1000)
+
+    def test_editing_a_limit_does_not_revoke_admin(self):
+        # The admin endpoint's provision_user defaults admin to None for this
+        # reason: a default of False silently took admin away from anyone
+        # whose record was edited for an unrelated reason.
+        import asyncio
+
+        from agentbridge.service import admin_api, provisioning, rabbit_mgmt
+        with mock.patch.object(rabbit_mgmt, "ensure_tenant"):
+            provisioning.provision("alice", admin=True)
+            result = asyncio.run(admin_api.provision_user(
+                "alice", max_cost_usd=1.0,
+                headers={config.USER_HEADER: "alice"}))
+        self.assertTrue(result["admin"], "admin was revoked as a side effect")
+        self.assertEqual(result["max_cost_usd"], 1.0)
 
 
 class Validation(unittest.TestCase):

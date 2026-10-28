@@ -73,7 +73,10 @@ def require_admin(headers: dict) -> Tenant:
 async def provision_user(
     name: str,
     max_workers: int | None = None,
-    admin: bool = False,
+    # None, not False: this tool is how an existing tenant's fields are
+    # changed, and a default of False silently revoked admin from anyone whose
+    # record was edited for an unrelated reason — including the caller's own.
+    admin: bool | None = None,
     reset_password: bool = False,
     max_cost_usd: float | None = None,
     max_tokens: int | None = None,
@@ -82,6 +85,9 @@ async def provision_user(
 ) -> dict:
     """Create (or update) a tenant: broker vhost and user, records, workspace
     and a login.
+
+    `admin` grants or revokes administrator rights; omitted, it leaves them
+    as they are.
 
     Returns a temporary login password **once** when one is issued — on
     creation, or with reset_password=True. It is stored only as bcrypt, so it

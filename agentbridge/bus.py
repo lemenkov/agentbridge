@@ -53,6 +53,12 @@ async def _declare_collector(channel, exch):
     return queue
 
 
+# Keys fold_messages gives its own meaning to; everything else on a `done`
+# message is passed through untouched.
+_FOLD_HANDLED = frozenset({"agent_id", "routing_key", "type", "task_id",
+                           "body", "rc", "done", "lines"})
+
+
 def fold_messages(messages: list[dict]) -> list[dict]:
     """Fold per-line bus messages into one result per (agent, task).
 
@@ -86,12 +92,13 @@ def fold_messages(messages: list[dict]) -> list[dict]:
         if kind == "done":
             entry["done"] = True
             entry["rc"] = msg.get("rc")
-            # Carry the driver's per-task figures through the fold: they are
-            # the whole point of `done` now, and a caller that only ever sees
-            # folded results would otherwise never get them.
-            for field in ("metrics", "driver_error", "expect", "ok"):
-                if field in msg:
-                    entry[field] = msg[field]
+            # Everything else the bridge put on `done` comes through, rather
+            # than a list of fields to remember to extend. An allowlist here
+            # has now silently dropped `metrics` (step 4) and `checkpoint`
+            # (step 8) from every caller that only ever sees folded results.
+            for field, value in msg.items():
+                if field not in _FOLD_HANDLED:
+                    entry[field] = value
             # A later task reusing the same key (e.g. no task_id) starts fresh.
             del open_by_key[key]
         else:

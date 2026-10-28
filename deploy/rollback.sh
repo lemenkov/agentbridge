@@ -27,7 +27,13 @@ ROOT="${2:-/workspace}"
 ONLY="${3:-ALL}"
 FORCE="${4:-no}"
 
-GIT="git -c safe.directory=* -c core.fsmonitor=false -c core.hooksPath=/dev/null"
+# A function, not a variable: `$GIT` unquoted would be glob-expanded, and
+# `safe.directory=*` is exactly the kind of word a stray file name could
+# change. Here the arguments are quoted once and cannot be re-interpreted.
+GIT() {
+    git -c "safe.directory=*" -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null "$@"
+}
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
 
@@ -54,7 +60,7 @@ find "$ROOT" -maxdepth 3 -name .git -type d 2>/dev/null | sort | while read -r g
             "$(json_escape "$rel")" "$1" "${2:-}"
     }
 
-    pre=$($GIT -C "$repo" rev-parse --verify --quiet "refs/agentbridge/pre/$TASK_ID" 2>/dev/null || true)
+    pre=$(GIT -C "$repo" rev-parse --verify --quiet "refs/agentbridge/pre/$TASK_ID" 2>/dev/null || true)
     if [ -z "$pre" ]; then
         emit "no_checkpoint"
         continue
@@ -75,21 +81,21 @@ find "$ROOT" -maxdepth 3 -name .git -type d 2>/dev/null | sort | while read -r g
         continue
     fi
 
-    now=$($GIT -C "$repo" rev-parse HEAD 2>/dev/null || true)
+    now=$(GIT -C "$repo" rev-parse HEAD 2>/dev/null || true)
     # Recorded before anything is moved, so the rollback is itself undoable.
-    [ -z "$now" ] || $GIT -C "$repo" update-ref "refs/agentbridge/post/$TASK_ID" "$now"
+    [ -z "$now" ] || GIT -C "$repo" update-ref "refs/agentbridge/post/$TASK_ID" "$now"
 
-    current=$($GIT -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    current=$(GIT -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
     if [ -n "$branch" ] && [ "$branch" = "$current" ]; then
         # On the recorded branch: move the worktree and the branch together.
-        $GIT -C "$repo" reset --hard "$pre" >/dev/null
+        GIT -C "$repo" reset --hard "$pre" >/dev/null
         emit "reset" ",\"from\":\"$now\",\"to\":\"$pre\",\"branch\":\"$(json_escape "$branch")\""
     elif [ -n "$branch" ]; then
         # Checked out elsewhere: move the branch only, and leave the worktree.
-        $GIT -C "$repo" update-ref "refs/heads/$branch" "$pre"
+        GIT -C "$repo" update-ref "refs/heads/$branch" "$pre"
         emit "branch_reset" ",\"from\":\"$now\",\"to\":\"$pre\",\"branch\":\"$(json_escape "$branch")\",\"note\":\"HEAD is on a different branch; only the recorded branch was moved\""
     else
-        $GIT -C "$repo" reset --hard "$pre" >/dev/null
+        GIT -C "$repo" reset --hard "$pre" >/dev/null
         emit "reset_detached" ",\"from\":\"$now\",\"to\":\"$pre\""
     fi
 done

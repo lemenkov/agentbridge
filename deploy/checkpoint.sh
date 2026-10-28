@@ -23,7 +23,13 @@ set -eu
 TASK_ID="${1:?usage: checkpoint.sh <task_id> [root]}"
 ROOT="${2:-/workspace}"
 
-GIT="git -c safe.directory=* -c core.fsmonitor=false -c core.hooksPath=/dev/null"
+# A function, not a variable: `$GIT` unquoted would be glob-expanded, and
+# `safe.directory=*` is exactly the kind of word a stray file name could
+# change. Here the arguments are quoted once and cannot be re-interpreted.
+GIT() {
+    git -c "safe.directory=*" -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null "$@"
+}
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
 
@@ -41,9 +47,9 @@ find "$ROOT" -maxdepth 3 -name .git -type d 2>/dev/null | sort | while read -r g
     rel=$(printf '%s' "$repo" | sed -e "s|^$ROOT||" -e 's|^/||')
     [ -n "$rel" ] || rel="."
 
-    head=$($GIT -C "$repo" rev-parse HEAD 2>/dev/null) || continue
-    branch=$($GIT -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-    if [ -n "$($GIT -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    head=$(GIT -C "$repo" rev-parse HEAD 2>/dev/null) || continue
+    branch=$(GIT -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    if [ -n "$(GIT -C "$repo" status --porcelain 2>/dev/null)" ]; then
         dirty=true
     else
         dirty=false
@@ -51,7 +57,7 @@ find "$ROOT" -maxdepth 3 -name .git -type d 2>/dev/null | sort | while read -r g
 
     # The ref is what rollback resets to; the sidecar remembers which branch
     # was checked out, which a ref alone cannot say.
-    $GIT -C "$repo" update-ref "refs/agentbridge/pre/$TASK_ID" "$head"
+    GIT -C "$repo" update-ref "refs/agentbridge/pre/$TASK_ID" "$head"
     mkdir -p "$gitdir/agentbridge"
     cat > "$gitdir/agentbridge/$TASK_ID.json" <<EOJSON
 {"task_id":"$(json_escape "$TASK_ID")","head":"$head","branch":"$(json_escape "$branch")","dirty":$dirty}

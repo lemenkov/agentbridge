@@ -98,10 +98,18 @@ def provision(name: str, *, max_workers: int | None = None,
             },
             "admin": bool(admin),
         }
+    limits = record.get("limits", {}) or {}
+    # Every field of the record, not a hand-picked subset: the return value
+    # reports these limits back to the caller, and a Tenant built from part of
+    # the record reported defaults for the rest.
     tenant = Tenant(
         name=name, vhost=record["vhost"], bus_user=record["bus_user"],
         bus_password=record["bus_password"],
-        max_workers=int(record["limits"]["max_workers"]),
+        max_workers=int(limits.get("max_workers", config.DEFAULT_MAX_WORKERS)),
+        max_cost_usd=float(limits.get("max_cost_usd",
+                                      config.DEFAULT_MAX_COST_USD)),
+        max_tokens=int(limits.get("max_tokens", config.DEFAULT_MAX_TOKENS)),
+        budget_window=str(limits.get("budget_window", config.BUDGET_WINDOW)),
         admin=bool(record.get("admin", False)),
     )
 

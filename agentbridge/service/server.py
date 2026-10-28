@@ -269,6 +269,14 @@ async def rollback_workspace(
     `repo` limits it to one repository (as the checkpoint reported it);
     omitted, every repository with a checkpoint for that task is rolled back.
     Only tasks on read-write roles have checkpoints.
+
+    Read the result rather than assuming success: `rolled_back` lists
+    repositories whose working tree was moved, `branch_only` those where HEAD
+    had since moved to another branch so only the recorded branch was reset
+    (normal when an implementer commits on its own branch — the work is still
+    in the tree, on that branch), `refused` those that were dirty at
+    checkpoint time, and `no_checkpoint` those with nothing recorded for this
+    task.
     """
     try:
         tenant = tenant_from_headers(headers)
@@ -290,22 +298,49 @@ async def rollback_workspace(
     repos = result.get("repos") or []
     if not repos:
         return _fail(
-            f"no checkpoint found for task {task_id!r} in your workspace — "
-            f"only tasks on read-write roles are checkpointed, and an agent "
-            f"can delete its own refs"
+            f"no repository found in your workspace to roll back (looked for "
+            f"a checkpoint from task {task_id!r})"
         )
-    log.info("user=%s tool=rollback_workspace task=%s repos=%d force=%s",
-             tenant.name, task_id, len(repos), force)
-    return {
+
+    def by_status(*wanted):
+        return [r["repo"] for r in repos if r.get("status") in wanted]
+
+    # Reported apart, because they are different outcomes and lumping them
+    # together would claim work was undone when it was not.
+    reset = by_status("reset", "reset_detached")
+    branch_only = by_status("branch_reset")
+    refused = by_status("refused_dirty")
+    missing = by_status("no_checkpoint")
+
+    response = {
         "task_id": task_id,
         "repos": repos,
-        "rolled_back": [r["repo"] for r in repos
-                        if str(r.get("status", "")).startswith(("reset",
-                                                                "branch_reset"))],
-        "refused": [r["repo"] for r in repos
-                    if r.get("status") == "refused_dirty"],
+        "rolled_back": reset,
+        "branch_only": branch_only,
+        "refused": refused,
+        "no_checkpoint": missing,
         "untracked_files_kept": True,
     }
+    if branch_only:
+        response["note"] = (
+            "HEAD is on a different branch than the checkpoint recorded, so "
+            "only the recorded branch was moved and the working tree still "
+            "holds the task's work. This is normal when an implementer commits "
+            "on its own branch. Check out the recorded branch to see the "
+            "rolled-back state."
+        )
+    if not reset and not branch_only:
+        response["note"] = (
+            f"nothing was rolled back: no repository had a checkpoint for task "
+            f"{task_id!r}. Only tasks on read-write roles are checkpointed, "
+            f"and an agent can delete its own refs."
+            if missing and not refused else
+            "nothing was rolled back; see each repository's status."
+        )
+    log.info("user=%s tool=rollback_workspace task=%s reset=%d branch=%d "
+             "refused=%d none=%d force=%s", tenant.name, task_id, len(reset),
+             len(branch_only), len(refused), len(missing), force)
+    return response
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
