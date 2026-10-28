@@ -903,6 +903,50 @@ async def list_git_credentials(headers: dict = _current_headers) -> dict:
             "hosts_allowed": list(gitcred.ALLOWED_HOSTS)}
 
 
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
+                       "openWorldHint": True})
+async def fetch_repo(dest: str, headers: dict = _current_headers) -> dict:
+    """Refresh an existing clone in your workspace from its origin.
+
+    Updates remote-tracking refs only (`origin/*` and tags) — your working
+    tree, your branches and `HEAD` are untouched, so nothing an agent has
+    committed is at risk. Merge or rebase is a task for an agent afterwards.
+
+    Two steps, for one reason: the authenticated fetch happens on the host
+    into a mirror the service owns, and a sandboxed container then fetches
+    from that mirror into your workspace. The credential never touches a
+    repository an agent can write, and that repository's own config is only
+    ever interpreted inside the sandbox.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+        target = workspace.resolve(tenant, dest)
+        if not target.is_dir():
+            return _fail(f"{dest!r} is not a directory in your workspace")
+        url = await asyncio.to_thread(gitcred.origin_url, target)
+        host, repo = gitcred.parse_url(url)
+        entry = gitcred.select(tenant, host, repo, scope="read")
+    except (TenantError, WorkspaceError, gitcred.GitCredError) as e:
+        return _fail(e)
+
+    try:
+        mirror = await gitcred.update_mirror(tenant, host, repo, url, entry)
+        rel = str(target.relative_to(tenant.workspace.resolve()))
+        role = checkpoint_mod.role_for_worker("implementer")
+        argv = checkpoint_mod.fetch_command(tenant, role, rel, str(mirror))
+        result = await checkpoint_mod.run_leaf(argv)
+    except (gitcred.GitCredError, checkpoint_mod.CheckpointError) as e:
+        return _fail(e)
+    if result.get("error"):
+        return _fail(f"the fetch leaf failed: {result['error']}")
+
+    log.info("user=%s tool=fetch_repo host=%s repo=%s %s", tenant.name, host,
+             repo, gitcred.safe_log_fields(entry))
+    return {"dest": dest, "repo": f"{host}/{repo}",
+            "authenticated": entry is not None,
+            "working_tree_unchanged": True, **result}
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def test_git_credential(
     repo_url: str, headers: dict = _current_headers

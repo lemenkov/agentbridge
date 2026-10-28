@@ -244,5 +244,95 @@ class Environment(GitCredBase):
                          "anonymous")
 
 
+class OriginUrl(GitCredBase):
+    """Read as text, because `git config` would interpret an agent's repo."""
+
+    def repo(self, body: str) -> Path:
+        repo = Path(self._tmp.name) / "repo"
+        (repo / ".git").mkdir(parents=True, exist_ok=True)
+        (repo / ".git" / "config").write_text(body)
+        return repo
+
+    def test_it_finds_the_origin_url(self):
+        repo = self.repo('[core]\n\tbare = false\n'
+                         '[remote "origin"]\n'
+                         '\turl = https://github.com/owner/name.git\n'
+                         '\tfetch = +refs/heads/*:refs/remotes/origin/*\n')
+        self.assertEqual(gitcred.origin_url(repo),
+                         "https://github.com/owner/name.git")
+
+    def test_another_remote_is_not_mistaken_for_origin(self):
+        repo = self.repo('[remote "upstream"]\n'
+                         '\turl = https://github.com/someone/else.git\n'
+                         '[remote "origin"]\n'
+                         '\turl = https://github.com/owner/name.git\n')
+        self.assertEqual(gitcred.origin_url(repo),
+                         "https://github.com/owner/name.git")
+
+    def test_a_repo_without_origin_is_a_caller_error(self):
+        with self.assertRaises(gitcred.GitCredError):
+            gitcred.origin_url(self.repo("[core]\n\tbare = false\n"))
+
+    def test_a_directory_that_is_not_a_repo(self):
+        plain = Path(self._tmp.name) / "plain"
+        plain.mkdir()
+        with self.assertRaises(gitcred.GitCredError):
+            gitcred.origin_url(plain)
+
+    def test_an_include_directive_is_not_followed(self):
+        # `git config` would read the included file. This must not: an agent
+        # writes this config, and pointing it at a file it cannot otherwise
+        # read should achieve nothing whatsoever.
+        repo = self.repo('[include]\n\tpath = /etc/shadow\n'
+                         '[remote "origin"]\n'
+                         '\turl = https://github.com/owner/name.git\n')
+        self.assertEqual(gitcred.origin_url(repo),
+                         "https://github.com/owner/name.git")
+
+
+class Mirrors(GitCredBase):
+    def test_the_mirror_lives_outside_the_workspace(self):
+        path = gitcred.mirror_path(self.alice, "github.com", "owner/name")
+        self.assertNotIn(str(config.WORKSPACES_DIR), str(path))
+        self.assertTrue(str(path).endswith("github.com/owner/name.git"))
+
+    def test_each_tenant_has_its_own(self):
+        (config.TENANTS_DIR / "bob.json").write_text(json.dumps({
+            "vhost": "ab-bob", "bus_user": "ab-bob", "bus_password": "p",
+            "limits": {"max_workers": 1}}))
+        bob = tenant_from_headers({config.USER_HEADER: "bob"})
+        self.assertNotEqual(
+            gitcred.mirror_path(self.alice, "github.com", "owner/name"),
+            gitcred.mirror_path(bob, "github.com", "owner/name"))
+
+
+class FetchLeaf(GitCredBase):
+    """The container half of fetch_repo (I-3)."""
+
+    def argv(self):
+        from agentbridge.service import checkpoint
+        return checkpoint.fetch_command(
+            self.alice, "implementer", "proj",
+            str(gitcred.mirror_path(self.alice, "github.com", "owner/name")))
+
+    def test_no_network_no_credential_no_claude(self):
+        joined = " ".join(self.argv())
+        self.assertIn("--network=none", joined)
+        self.assertNotIn("--secret", joined)
+        self.assertNotIn("claude", joined)
+        self.assertNotIn("GIT_CONFIG_VALUE", joined)
+
+    def test_the_mirror_is_mounted_read_only(self):
+        argv = self.argv()
+        mount = next(a for a in argv if a.endswith(":/mirror:ro"))
+        self.assertIn(".mirrors", mount)
+
+    def test_the_workspace_is_writable_and_the_script_is_not(self):
+        argv = self.argv()
+        self.assertIn(f"{self.alice.workspace}:/workspace:rw", argv)
+        script = next(a for a in argv if a.endswith("/script.sh:ro"))
+        self.assertFalse(script.startswith(str(self.alice.workspace)))
+
+
 if __name__ == "__main__":
     unittest.main()

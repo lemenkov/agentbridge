@@ -81,9 +81,17 @@ def _script(name: str) -> str:
     return str(path)
 
 
-def _leaf(tenant: Tenant, role_name: str, script: str, args: list[str]) -> list[str]:
-    """The podman argv for a git leaf. No credential, no claude, no network."""
+def _leaf(tenant: Tenant, role_name: str, script: str, args: list[str],
+          extra_mounts: tuple[tuple[str, str, str], ...] = ()) -> list[str]:
+    """The podman argv for a git leaf. No credential, no claude, no network.
+
+    ``extra_mounts`` is ``(host path, container path, mode)``; `fetch_repo`
+    uses it to offer the bare mirror read-only.
+    """
     role = ROLES[role_name]
+    mounts: list[str] = []
+    for source, target, mode in extra_mounts:
+        mounts += ["-v", f"{source}:{target}:{mode}"]
     return [
         "podman", "run", "--rm",
         "--cgroups=split",
@@ -98,6 +106,7 @@ def _leaf(tenant: Tenant, role_name: str, script: str, args: list[str]) -> list[
         # something the agent can edit.
         "-v", f"{tenant.workspace}:/workspace:rw",
         "-v", f"{script}:/script.sh:ro",
+        *mounts,
         "-w", "/workspace",
         role.image,
         "sh", "/script.sh", *args,
@@ -114,6 +123,22 @@ def rollback_command(tenant: Tenant, role_name: str, task_id: str,
                      repo: str, force: bool) -> list[str]:
     return _leaf(tenant, role_name, _script(ROLLBACK_SCRIPT),
                  [task_id, "/workspace", repo, "force" if force else "no"])
+
+
+FETCH_SCRIPT = "fetch-mirror.sh"
+
+
+def fetch_command(tenant: Tenant, role_name: str, rel: str,
+                  mirror: str) -> list[str]:
+    """Update a workspace clone from a host-owned mirror, inside a leaf.
+
+    The mirror is mounted read-only: the authenticated fetch already happened
+    on the host, so nothing in this container needs — or has — a credential,
+    and it has no network either.
+    """
+    return _leaf(tenant, role_name, _script(FETCH_SCRIPT),
+                 [rel, "/workspace", "/mirror"],
+                 extra_mounts=((mirror, "/mirror", "ro"),))
 
 
 async def run_leaf(argv: list[str]) -> dict:

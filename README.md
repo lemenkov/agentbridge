@@ -181,6 +181,15 @@ git invocation through `GIT_CONFIG_*`. `list_git_credentials` and
 seeing a value. Read and write are separate credentials: `clone_repo` can only
 use a read one.
 
+`fetch_repo` refreshes an existing clone in two steps, for one reason: the
+authenticated fetch runs on the host into a bare mirror the service owns, and a
+sandboxed container then fetches from that mirror into the workspace. So the
+credential never touches a repository an agent can write, and that
+repository's config — which an agent *can* write, and which git treats as a
+program — is only ever interpreted inside the sandbox. It updates
+remote-tracking refs only; your branches, working tree and `HEAD` are left
+alone.
+
 Before each task on a read-write role, every git repository in the workspace
 is checkpointed (`refs/agentbridge/pre/<task_id>`), and `rollback_workspace`
 resets the recorded branch back to it. The rollback records the discarded tip

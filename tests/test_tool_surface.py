@@ -28,7 +28,7 @@ USER_TOOLS = {
     "register_credential", "revoke_credential", "set_password",
     "set_git_identity", "fleet_status", "task_history", "usage_summary",
     "run_check", "check_result", "rollback_workspace",
-    "list_git_credentials", "test_git_credential",
+    "list_git_credentials", "test_git_credential", "fetch_repo",
 }
 
 ADMIN_TOOLS = {"provision_user", "deprovision_user", "list_users"}

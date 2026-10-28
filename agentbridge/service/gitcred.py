@@ -346,6 +346,88 @@ def git_env(tenant: Tenant, entry: dict | None, base: dict | None = None) -> dic
     return env
 
 
+# ------------------------------------------------------------------- mirrors
+
+
+def mirror_path(tenant: Tenant, host: str, repo: str) -> Path:
+    owner, name = repo.split("/", 1)
+    return (config.TENANTS_DIR / f"{tenant.name}.mirrors" / host / owner
+            / f"{name}.git")
+
+
+_ORIGIN_RE = re.compile(
+    r'\[remote\s+"origin"\]([^\[]*)', re.IGNORECASE | re.DOTALL)
+_URL_RE = re.compile(r"^\s*url\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def origin_url(repo_dir: Path) -> str:
+    """``remote.origin.url`` read as **text**, never via git.
+
+    `git -C <repo> config` would interpret that repository's own
+    configuration, and a repository in a workspace is written by an agent:
+    `include.path` alone can make git read files it should not. Reading the
+    file and matching two patterns cannot execute or include anything.
+    """
+    try:
+        text = (repo_dir / ".git" / "config").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        raise GitCredError(
+            f"{repo_dir.name!r} is not a git repository (no .git/config)"
+        ) from None
+    section = _ORIGIN_RE.search(text)
+    if not section:
+        raise GitCredError(f"{repo_dir.name!r} has no 'origin' remote")
+    found = _URL_RE.search(section.group(1))
+    if not found:
+        raise GitCredError(f"{repo_dir.name!r} has no url for 'origin'")
+    return found.group(1).strip()
+
+
+async def update_mirror(tenant: Tenant, host: str, repo: str, url: str,
+                        entry: dict | None) -> Path:
+    """Fetch into the tenant's host-owned bare mirror, with the credential.
+
+    The mirror exists so the credential never has to be used inside a
+    repository an agent can write: its config is the service's own.
+    """
+    import asyncio
+
+    path = mirror_path(tenant, host, repo)
+    env = git_env(tenant, entry)
+    if (path / "HEAD").exists():
+        argv = ["git", "-C", str(path), "-c", "protocol.allow=never",
+                "-c", "protocol.https.allow=always",
+                "fetch", "--prune", "--no-tags", "origin",
+                "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(config.TENANTS_DIR / f"{tenant.name}.mirrors", 0o700)
+        argv = ["git", "-c", "protocol.allow=never",
+                "-c", "protocol.https.allow=always",
+                "-c", "core.hooksPath=/dev/null",
+                "clone", "--mirror", "--", url, str(path)]
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(),
+                                        timeout=config.CLONE_TIMEOUT)
+    except TimeoutError:
+        proc.kill()
+        raise GitCredError(
+            f"the mirror fetch timed out after {config.CLONE_TIMEOUT}s"
+        ) from None
+    if proc.returncode != 0:
+        # git's stderr can echo the URL; it never contains the auth header.
+        raise GitCredError(
+            f"the mirror fetch failed: "
+            f"{err.decode(errors='replace').strip()[-400:]}"
+        )
+    return path
+
+
 def safe_log_fields(entry: dict | None) -> dict:
     """What may be logged about a credential: its id and shape, never its value."""
     if entry is None:

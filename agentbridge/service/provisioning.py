@@ -168,6 +168,8 @@ def deprovision(name: str, *, purge: bool = False,
     # leaving tokens on disk after a tenant is gone is how a forgotten secret
     # outlives everything that could justify it.
     shutil.rmtree(config.TENANTS_DIR / f"{tenant.name}.git", ignore_errors=True)
+    shutil.rmtree(config.TENANTS_DIR / f"{tenant.name}.mirrors",
+                  ignore_errors=True)
 
     purged = []
     if purge:
