@@ -7,15 +7,20 @@
     agentbridge-admin list
     agentbridge-admin deprovision petro [--purge]
 
-The bus password is service plumbing: generated here, handed to rabbitmqctl
-only as a salted hash, stored 0600 for the service user, and never shown. A user's only secret
-is their Anthropic credential, which the operator registers out of band as a
-podman secret of the service user (printed as the last provisioning step).
+A thin CLI over the same library functions the service uses, kept for
+bootstrap and recovery. The broker side goes through the management API
+(``rabbit_mgmt``), so there is no ``rabbitmqctl`` and no Erlang cookie here
+any more; the login goes into the service's own password file
+(``htpasswd``), never the fleet-wide one.
+
+Two secrets, handled differently. The bus password is service plumbing:
+generated here, sent to the broker only as a salted hash, stored 0600 for the
+service user, never shown. The login password is the user's: generated here
+and printed **once**, stored only as bcrypt. A user's Anthropic credential is
+registered out of band as a podman secret (printed as the last step).
 """
 
 import argparse
-import base64
-import hashlib
 import json
 import os
 import pwd
@@ -26,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-SYSCONFIG = Path("/etc/sysconfig/mcp-agentbridge")
+SYSCONFIG = Path(os.environ.get("SYSCONFIG_PATH", "/etc/sysconfig/mcp-agentbridge"))
 
 
 def _load_sysconfig() -> None:
@@ -48,30 +53,27 @@ def _service_user() -> pwd.struct_passwd:
         sys.exit(f"service user {name!r} does not exist — run deploy/setup-host.sh first")
 
 
-def _rabbitmqctl(*args: str, check: bool = True) -> str:
-    proc = subprocess.run(
-        ["rabbitmqctl", "--quiet", *args], stdin=subprocess.DEVNULL, text=True,
-        capture_output=True, check=False,
-    )
-    if check and proc.returncode != 0:
-        sys.exit(f"rabbitmqctl {args[0]} failed: {proc.stderr.strip()}")
-    return proc.stdout
-
-
-def _rabbit_password_hash(password: str) -> str:
-    """RabbitMQ's default (rabbit_password_hashing_sha256) stored form:
-    base64(salt || sha256(salt || password)) with a 4-byte random salt. Passing
-    this to `add_user --pre-hashed-password` keeps the password out of argv."""
-    salt = secrets.token_bytes(4)
-    return base64.b64encode(salt + hashlib.sha256(salt + password.encode()).digest()).decode()
-
-
 def _as_service_user(svc: pwd.struct_passwd, *argv: str) -> subprocess.CompletedProcess:
     env = {"PATH": "/usr/bin:/bin", "HOME": svc.pw_dir,
            "XDG_RUNTIME_DIR": f"/run/user/{svc.pw_uid}"}
     return subprocess.run(["runuser", "-u", svc.pw_name, "--", "env",
                            *(f"{k}={v}" for k, v in env.items()), *argv],
                           text=True, capture_output=True, check=False)
+
+
+def _secret_runner(svc: pwd.struct_passwd):
+    """A ``secrets`` runner that reaches the service user's podman store."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": svc.pw_dir,
+           "XDG_RUNTIME_DIR": f"/run/user/{svc.pw_uid}"}
+
+    def run(argv, stdin=None):
+        return subprocess.run(
+            ["runuser", "-u", svc.pw_name, "--", "env",
+             *(f"{k}={v}" for k, v in env.items()), *argv],
+            input=stdin, capture_output=True, check=False,
+        )
+
+    return run
 
 
 def _write_private(path: Path, text: str, svc: pwd.struct_passwd) -> None:
@@ -82,8 +84,37 @@ def _write_private(path: Path, text: str, svc: pwd.struct_passwd) -> None:
     os.chown(path, svc.pw_uid, svc.pw_gid)
 
 
-def cmd_provision(args: argparse.Namespace) -> None:
+def _fix_htpasswd_ownership(svc: pwd.struct_passwd) -> None:
+    """Hand the password file back to the service user and nginx's group.
+
+    We write it as root, so without this the file, its lock and its backup end
+    up root-owned: nginx then cannot read the file (a 500 on every
+    *authenticated* request, which looks nothing like an auth problem), and the
+    service cannot take the lock to change a password later.
+    """
+    import grp
+
     from . import config
+
+    try:
+        web_gid = grp.getgrnam("nginx").gr_gid
+    except KeyError:
+        web_gid = svc.pw_gid
+    directory = config.HTPASSWD_FILE.parent
+    for path, mode, gid in (
+        (directory, 0o750, web_gid),
+        (config.HTPASSWD_FILE, 0o640, web_gid),
+        (directory / ".lock", 0o640, svc.pw_gid),
+        (config.HTPASSWD_FILE.with_name(config.HTPASSWD_FILE.name + ".bak"),
+         0o640, web_gid),
+    ):
+        if path.exists():
+            os.chown(path, svc.pw_uid, gid)
+            os.chmod(path, mode)
+
+
+def cmd_provision(args: argparse.Namespace) -> None:
+    from . import config, htpasswd, rabbit_mgmt
     from .tenant import Tenant, TenantError, validate_username
 
     try:
@@ -109,19 +140,13 @@ def cmd_provision(args: argparse.Namespace) -> None:
                     bus_password=record["bus_password"],
                     max_workers=record["limits"]["max_workers"])
 
-    # Broker: vhost + a user permitted on that vhost only. Only a salted hash of
-    # the password reaches argv. change_password has no pre-hashed form, so
-    # re-running re-creates the user to resync it to the record.
-    if tenant.vhost not in _rabbitmqctl("list_vhosts", "name").split():
-        _rabbitmqctl("add_vhost", tenant.vhost)
-    users = [line.split()[0] for line in
-             _rabbitmqctl("list_users", "--no-table-headers").splitlines() if line.strip()]
-    if tenant.bus_user in users:
-        _rabbitmqctl("delete_user", tenant.bus_user)
-    _rabbitmqctl("add_user", tenant.bus_user,
-                 _rabbit_password_hash(tenant.bus_password), "--pre-hashed-password")
-    _rabbitmqctl("set_permissions", "-p", tenant.vhost, tenant.bus_user,
-                 ".*", ".*", ".*")
+    # Broker: vhost + a user permitted on that vhost only, over the management
+    # API. Every call is a PUT, so re-running simply resyncs the broker to the
+    # record — no delete-then-recreate, as rabbitmqctl needed.
+    try:
+        rabbit_mgmt.ensure_tenant(tenant.vhost, tenant.bus_user, tenant.bus_password)
+    except rabbit_mgmt.RabbitError as e:
+        sys.exit(str(e))
 
     # Files: tenant record + bus URL file (0600, service user), workspace (0700).
     config.TENANTS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -135,39 +160,56 @@ def cmd_provision(args: argparse.Namespace) -> None:
     tenant.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chown(tenant.workspace, svc.pw_uid, svc.pw_gid)
 
+    # Login: our own password file, not the fleet-wide one. A generated
+    # password is printed once and never stored in the clear.
+    new_password = None
+    if args.reset_password or not htpasswd.has_entry(name):
+        new_password = htpasswd.generate_password()
+        htpasswd.set_entry(name, new_password)
+    _fix_htpasswd_ownership(svc)
+
     print(f"provisioned {name}: vhost {tenant.vhost}, bus user {tenant.bus_user}, "
           f"workspace {tenant.workspace}, max_workers {tenant.max_workers}")
     if not tenant.gitconfig.exists():
         print("  note: no committer identity (--git-name/--git-email); "
               "implementers will not be able to commit")
-    print("Remaining manual steps:")
-    print(f"  htpasswd /etc/nginx/.htpasswd-mcp {name}        # if not already there")
+    if new_password:
+        print(f"  login password (shown once, not stored): {new_password}")
+    else:
+        print(f"  login unchanged in {config.HTPASSWD_FILE} "
+              f"(use --reset-password to issue a new one)")
+    print("Remaining manual step:")
     print(f"  runuser -u {svc.pw_name} -- env XDG_RUNTIME_DIR=/run/user/{svc.pw_uid} "
           f"podman secret create {tenant.secret_name('apikey')} -   # or -oauth; value on stdin")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    from . import config
+    from . import config, htpasswd
+    from . import secrets as secrets_mod
 
     svc = _service_user()
-    secrets_out = _as_service_user(svc, "podman", "secret", "ls", "--format", "{{.Name}}")
-    secret_names = set(secrets_out.stdout.split())
+    try:
+        secret_names = secrets_mod.names(runner=_secret_runner(svc))
+    except secrets_mod.SecretError as e:
+        sys.exit(str(e))
     units = _as_service_user(svc, "systemctl", "--user", "list-units",
                              "agentbridge-*", "--all", "--output=json", "--no-pager")
     unit_names = [u.get("unit", "") for u in json.loads(units.stdout or "[]")]
-    print(f"{'user':<16} {'credential':<10} {'workers':>7}  {'max':>3}")
+    logins = set(htpasswd.entries())
+    print(f"{'user':<16} {'credential':<10} {'login':<6} {'workers':>7}  {'max':>3}")
     for path in sorted(config.TENANTS_DIR.glob("*.json")):
         name = path.stem
         record = json.loads(path.read_text())
         cred = next((k for k in ("apikey", "oauth")
                      if f"anthropic-{name}-{k}" in secret_names), "-")
         count = sum(1 for u in unit_names if u.startswith(f"agentbridge-{name}-"))
-        print(f"{name:<16} {cred:<10} {count:>7}  "
+        print(f"{name:<16} {cred:<10} {('yes' if name in logins else 'no'):<6} {count:>7}  "
               f"{record.get('limits', {}).get('max_workers', '?'):>3}")
 
 
 def cmd_deprovision(args: argparse.Namespace) -> None:
-    from . import config
+    from . import config, htpasswd, rabbit_mgmt
+    from . import secrets as secrets_mod
     from .tenant import TenantError, load_tenant
 
     try:
@@ -176,21 +218,26 @@ def cmd_deprovision(args: argparse.Namespace) -> None:
         sys.exit(str(e))
     svc = _service_user()
     _as_service_user(svc, "systemctl", "--user", "stop", f"{tenant.unit_prefix}*")
-    _rabbitmqctl("delete_vhost", tenant.vhost, check=False)
-    _rabbitmqctl("delete_user", tenant.bus_user, check=False)
+    try:
+        rabbit_mgmt.delete_vhost(tenant.vhost)
+        rabbit_mgmt.delete_user(tenant.bus_user)
+    except rabbit_mgmt.RabbitError as e:
+        sys.exit(str(e))
+    had_login = htpasswd.remove_entry(tenant.name)
+    _fix_htpasswd_ownership(svc)
     for path in (config.TENANTS_DIR / f"{tenant.name}.json", tenant.amqp_url_file,
                  tenant.gitconfig):
         path.unlink(missing_ok=True)
-    print(f"deprovisioned {tenant.name}: workers stopped, vhost and bus user deleted")
+    print(f"deprovisioned {tenant.name}: workers stopped, vhost and bus user deleted"
+          + (", login removed" if had_login else ""))
     if args.purge:
         shutil.rmtree(tenant.workspace, ignore_errors=True)
+        runner = _secret_runner(svc)
         for kind in ("apikey", "oauth"):
-            _as_service_user(svc, "podman", "secret", "rm", tenant.secret_name(kind))
+            secrets_mod.remove(tenant.secret_name(kind), runner=runner)
         print(f"  purged workspace {tenant.workspace} and credential secrets")
     else:
         print(f"  kept workspace {tenant.workspace} and credential secrets (use --purge)")
-    print(f"  remove the nginx login by hand if wanted: htpasswd -D "
-          f"/etc/nginx/.htpasswd-mcp {tenant.name}")
 
 
 def main() -> None:
@@ -203,6 +250,8 @@ def main() -> None:
     p.add_argument("--max-workers", type=int, default=None)
     p.add_argument("--git-name", help="committer name for implementer commits")
     p.add_argument("--git-email", help="committer email for implementer commits")
+    p.add_argument("--reset-password", action="store_true",
+                   help="issue a new login password even if one exists")
     p.set_defaults(func=cmd_provision)
 
     p = sub.add_parser("list", help="list tenants, credentials and worker counts")

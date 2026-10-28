@@ -19,7 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 systemd = ["systemd-python"]
-mcp = ["fastmcp>=3.0.0,<4"]
+# httpx comes with fastmcp; bcrypt is named explicitly because the venv
+# cannot see Fedora's python3-bcrypt.
+mcp = ["fastmcp>=3.0.0,<4", "httpx>=0.27", "bcrypt>=4.0"]
 
 [project.scripts]
 agentbridge = "agentbridge.bridge:main"

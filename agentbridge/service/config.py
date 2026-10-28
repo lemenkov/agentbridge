@@ -24,6 +24,22 @@ USER_HEADER = os.environ.get("USER_HEADER", "x-forwarded-user").lower()
 AMQP_HOST = os.environ.get("AMQP_HOST", "localhost:5672")
 EXCHANGE = os.environ.get("AGENTBRIDGE_EXCHANGE", "agents")
 
+# Where the admin credentials live, named in errors so the operator knows
+# which file to edit.
+SYSCONFIG_PATH = os.environ.get("SYSCONFIG_PATH", "/etc/sysconfig/mcp-agentbridge")
+
+# RabbitMQ management API: loopback only (plan 0.1a), reached with an
+# administrator account instead of rabbitmqctl's Erlang cookie (plan 0.4).
+RABBITMQ_API = os.environ.get("RABBITMQ_API", "http://127.0.0.1:15672/api")
+RABBITMQ_ADMIN_USER = os.environ.get("RABBITMQ_ADMIN_USER", "")
+RABBITMQ_ADMIN_PASSWORD = os.environ.get("RABBITMQ_ADMIN_PASSWORD", "")
+
+# This service's own nginx password file — never /etc/nginx/.htpasswd-mcp,
+# which is server-level and grants every fleet MCP.
+HTPASSWD_FILE = Path(
+    os.environ.get("HTPASSWD_FILE", "/var/lib/mcp-agentbridge/htpasswd/users")
+)
+
 # The bridge runs from the same venv as the service.
 BRIDGE_BIN = os.environ.get(
     "AGENTBRIDGE_BIN", str(Path(sys.executable).parent / "agentbridge")
