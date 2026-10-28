@@ -40,6 +40,18 @@ guessing:
 The orchestrator reads your output and decides what happens next, possibly
 sending a follow-up task to a fresh instance of you.
 
+## Declared Outputs
+
+A task may name files you must leave behind, listed in the task itself as
+*declared outputs*. Write them under `/out` — that directory is yours alone
+for this task and is writable even when the workspace is read-only, so it is
+how you deliver a result you cannot commit.
+
+They are checked **on the host** after you exit. A file that is missing,
+empty, a symlink, or left over from an earlier run fails the task whatever
+your final message says. Write the file before you finish, and do not report
+success you have not produced.
+
 ## Behaviour Rules
 
 - Work autonomously and finish the task within this single run.

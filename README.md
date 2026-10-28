@@ -153,6 +153,15 @@ Workers can be given a default model and effort at spawn
 (`spawn_worker(role, model="opus", effort="high")`), and any single task can
 override them (`send_task(..., model="haiku", effort="low")`).
 
+A task can declare what it will produce: `send_task(..., expect=["review.md"])`.
+Every task gets its own directory mounted at `/out` — writable even for a
+read-only role, so a reviewer can deliver a verdict without write access to
+the code it reviewed — and the host checks the declared files after the agent
+exits. A file that is missing, empty, a symlink or left over from an earlier
+run fails the task whatever the agent reported, and `done.ok` is true only when
+the exit code was 0 *and* every declared output passed. `collect` returns the
+files, inline when small.
+
 `run_check` runs a command against the workspace and reports its exit code,
 so nobody has to ask an agent whether the tests passed. Its container gets no
 credential, no `claude` binary and `--network=none`, and the workspace is

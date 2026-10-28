@@ -23,9 +23,11 @@ import sys
 import time
 import uuid
 from collections.abc import Mapping
+from pathlib import Path
 
 import aio_pika
 
+from . import expect as expect_mod
 from . import ledger
 from .drivers import DEFAULT_DRIVER, DRIVERS, make_driver
 from .status import StatusWriter
@@ -123,6 +125,7 @@ async def bridge(
     role: str | None = None,
     backend: str = "anthropic",
     status_file: str | None = None,
+    out_template: str | None = None,
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
 
@@ -181,8 +184,9 @@ async def bridge(
                 "allowed" if allow_task_overrides else "refused")
     logger.info("Driver: %s | role: %s | backend: %s",
                 driver_name, role or "unset", backend)
-    logger.info("Ledger: %s | status file: %s",
-                ledger_file or "off", status_file or "off")
+    logger.info("Ledger: %s | status file: %s | /out: %s",
+                ledger_file or "off", status_file or "off",
+                out_template or "off")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -196,8 +200,22 @@ async def bridge(
             routing_key=routing_key,
         )
 
+    def task_out_dir(task_id: str) -> Path | None:
+        """The host directory mounted at /out for this task, created now.
+
+        Substitution is a literal replace rather than str.format: a workspace
+        path may legitimately contain braces, and format() would either raise
+        or interpret them.
+        """
+        if not out_template:
+            return None
+        path = Path(out_template.replace("{task_id}", task_id))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     async def run_task(
-        task_text: str, task_id: str | None, options: dict[str, str]
+        task_text: str, task_id: str | None, options: dict[str, str],
+        out_dir: Path | None = None,
     ) -> dict:
         """Spawn the agent fresh, feed it the task on stdin, republish stdout.
 
@@ -206,8 +224,12 @@ async def bridge(
         payload = f"{preamble}\n\nYour task: {task_text}" if preamble else task_text
         driver = make_driver(driver_name)
 
+        argv = command
+        if out_dir is not None and task_id is not None:
+            argv = [arg.replace("{task_id}", task_id) for arg in command]
+
         proc = await asyncio.create_subprocess_exec(
-            *command,
+            *argv,
             *driver.extra_args,
             *option_args(options),
             stdin=asyncio.subprocess.PIPE,
@@ -340,6 +362,9 @@ async def bridge(
             record["models"] = metrics["models"]
         if result.get("driver_error"):
             record["driver_error"] = result["driver_error"]
+        if "expect_ok" in result:
+            record["expect_ok"] = result["expect_ok"]
+            record["ok"] = result["rc"] == 0 and result["expect_ok"]
         try:
             ledger.append(ledger_file, {k: v for k, v in record.items()
                                         if v is not None})
@@ -394,6 +419,11 @@ async def bridge(
                     logger.info("← task %s (%d bytes)", task_id, len(task.encode()))
                 options = dict(default_options or {})
                 error = None
+                declared: list[str] = []
+                try:
+                    declared = expect_mod.validate(payload.get("expect"))
+                except expect_mod.ExpectError as exc:
+                    error = str(exc)
                 requested = {k: payload[k] for k in ("model", "effort") if k in payload}
                 if requested and not allow_task_overrides:
                     error = "this worker does not accept per-task model/effort"
@@ -408,6 +438,9 @@ async def bridge(
                 if error is None:
                     ts_start = ledger.now_iso()
                     started = time.monotonic()
+                    # mtime comparison needs wall clock, and one second of
+                    # slack absorbs filesystem timestamp granularity.
+                    started_wall = time.time() - 1.0
                     start_message = {
                         "agent_id": agent_id,
                         "routing_key": progress_key,
@@ -419,7 +452,18 @@ async def bridge(
                     await publish(progress_key, start_message)
 
                     status.task_started(task_id, options)
-                    result = await run_task(task, task_id, options)
+                    out_dir = task_out_dir(task_id) if task_id else None
+                    # The agent is told what it owes before it starts, and the
+                    # host checks afterwards; the prompt alone would be a
+                    # request, not a guarantee.
+                    text = task + expect_mod.prompt_line(declared)
+                    result = await run_task(text, task_id, options, out_dir)
+                    if declared:
+                        statuses = expect_mod.check(
+                            out_dir, declared, not_before=started_wall
+                        ) if out_dir else dict.fromkeys(declared, expect_mod.MISSING)
+                        result["expect"] = statuses
+                        result["expect_ok"] = expect_mod.all_ok(statuses)
                     rc = result["rc"]
                     duration_ms = int((time.monotonic() - started) * 1000)
                     record_task(task_id, options, result, ts_start, duration_ms)
@@ -465,6 +509,14 @@ async def bridge(
                     done["metrics"] = result["metrics"]
                     if result["driver_error"]:
                         done["driver_error"] = result["driver_error"]
+                    if "expect" in result:
+                        done["expect"] = result["expect"]
+                    # The single question a caller actually has: did this task
+                    # succeed? A zero exit code with a missing declared output
+                    # is not a success.
+                    done["ok"] = rc == 0 and result.get("expect_ok", True)
+                else:
+                    done["ok"] = False
                 await publish(outbox, done)
 
         last_activity = time.monotonic()
@@ -583,6 +635,15 @@ def main() -> None:
         help="Role name recorded in the ledger (not passed to the agent).",
     )
     parser.add_argument(
+        "--out-template",
+        default=None,
+        metavar="PATH",
+        help="Per-task output directory, with {task_id} substituted (e.g. "
+             "/srv/agentbridge/u/.outbox/{task_id}). The bridge creates it, "
+             "substitutes {task_id} in the wrapped command's arguments too, "
+             "and checks any declared outputs in it after the agent exits.",
+    )
+    parser.add_argument(
         "--status-file",
         default=None,
         metavar="PATH",
@@ -658,6 +719,7 @@ def main() -> None:
         role=args.role,
         backend=args.backend,
         status_file=args.status_file,
+        out_template=args.out_template,
     ))
 
 

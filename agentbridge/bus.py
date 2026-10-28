@@ -89,7 +89,7 @@ def fold_messages(messages: list[dict]) -> list[dict]:
             # Carry the driver's per-task figures through the fold: they are
             # the whole point of `done` now, and a caller that only ever sees
             # folded results would otherwise never get them.
-            for field in ("metrics", "driver_error"):
+            for field in ("metrics", "driver_error", "expect", "ok"):
                 if field in msg:
                     entry[field] = msg[field]
             # A later task reusing the same key (e.g. no task_id) starts fresh.

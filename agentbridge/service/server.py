@@ -18,6 +18,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 from fastmcp.dependencies import CurrentHeaders
 
+from .. import expect as expect_mod
 from .. import ledger
 from ..bridge import validate_task_options
 from ..bus import fold_messages
@@ -509,6 +510,7 @@ async def send_task(
     body: str,
     model: str | None = None,
     effort: str | None = None,
+    expect: list[str] | None = None,
     headers: dict = _current_headers,
 ) -> dict:
     """Send a task to one worker (`<id>.inbox`) or to a role pool
@@ -518,11 +520,20 @@ async def send_task(
 
     `model`/`effort` override the worker's defaults for this task only (same
     values as spawn_worker) — e.g. haiku for quick triage, opus at high effort
-    for a hard task."""
+    for a hard task.
+
+    `expect` declares the files the task must leave in its own output
+    directory (mounted at `/out` in the container, writable even for
+    read-only roles), e.g. `expect=["review-result.md"]`. The host checks them
+    after the agent exits: `done.ok` is true only if the exit code was 0 **and**
+    every declared file exists, is non-empty, is a real file and was written by
+    this task. Prefer this to trusting an agent's own account of what it
+    produced; `collect` returns the files."""
     try:
         tenant = tenant_from_headers(headers)
         options = validate_task_options(model, effort)
-    except (TenantError, ValueError) as e:
+        declared = expect_mod.validate(expect)
+    except (TenantError, ValueError, expect_mod.ExpectError) as e:
         return _fail(e)
     if to.endswith(".inbox"):
         if to.removesuffix(".inbox") not in await _worker_ids(tenant):
@@ -533,11 +544,15 @@ async def send_task(
     else:
         return _fail("`to` must be `<worker id>.inbox` or `<role>.work`")
     task_id = broker.new_task_id()
-    await broker.publish(tenant, to, {"body": body, "task_id": task_id, **options})
+    message = {"body": body, "task_id": task_id, **options}
+    if declared:
+        message["expect"] = declared
+    await broker.publish(tenant, to, message)
     await broker.publish_dispatch(tenant, task_id, to)
     log.info("user=%s tool=send_task to=%s task=%s bytes=%d options=%s", tenant.name,
              to, task_id, len(body.encode()), options or "default")
-    return {"sent": True, "routing_key": to, "task_id": task_id}
+    return {"sent": True, "routing_key": to, "task_id": task_id,
+            **({"expect": declared} if declared else {})}
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
@@ -546,18 +561,26 @@ async def broadcast(
     body: str,
     model: str | None = None,
     effort: str | None = None,
+    expect: list[str] | None = None,
     headers: dict = _current_headers,
 ) -> dict:
     """Send `body` as a task to every one of your workers at once (optionally
-    overriding model/effort, as in send_task)."""
+    overriding model/effort, or declaring outputs, as in send_task).
+
+    Every worker runs it under the same task_id, so they share one `/out`
+    directory — declare outputs here only when one answer is wanted, not one
+    per worker."""
     try:
         tenant = tenant_from_headers(headers)
         options = validate_task_options(model, effort)
-    except (TenantError, ValueError) as e:
+        declared = expect_mod.validate(expect)
+    except (TenantError, ValueError, expect_mod.ExpectError) as e:
         return _fail(e)
     task_id = broker.new_task_id()
-    await broker.publish(tenant, "orchestrator.broadcast",
-                         {"body": body, "task_id": task_id, **options})
+    message = {"body": body, "task_id": task_id, **options}
+    if declared:
+        message["expect"] = declared
+    await broker.publish(tenant, "orchestrator.broadcast", message)
     await broker.publish_dispatch(tenant, task_id, "orchestrator.broadcast")
     log.info("user=%s tool=broadcast task=%s bytes=%d", tenant.name, task_id,
              len(body.encode()))
@@ -565,6 +588,34 @@ async def broadcast(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+def _declared_files(tenant, entry: dict) -> dict:
+    """Return each declared output that passed: inline when small, else a ref.
+
+    A ref is a workspace-relative path, so `workspace_read` can fetch the rest
+    without this result carrying a megabyte of it.
+    """
+    task_id = entry.get("task_id")
+    files: dict[str, dict] = {}
+    if not task_id:
+        return files
+    for name, status in (entry.get("expect") or {}).items():
+        if status != expect_mod.OK:
+            files[name] = {"status": status}
+            continue
+        rel = f"{workspace.OUTBOX}/{task_id}/{name}"
+        try:
+            path = workspace.resolve(tenant, rel)
+            size = path.stat().st_size
+        except (OSError, WorkspaceError) as exc:
+            files[name] = {"status": "unreadable", "error": str(exc)}
+            continue
+        row: dict = {"status": expect_mod.OK, "bytes": size, "ref": rel}
+        if size <= config.INLINE_MAX_BYTES:
+            row["text"] = path.read_text(encoding="utf-8", errors="replace")
+        files[name] = row
+    return files
+
+
 async def collect(
     idle: float = 30,
     done: int = 0,
@@ -599,6 +650,9 @@ async def collect(
             entry["ref"] = workspace.outbox_put(tenant, token, i, body)
             entry["bytes"] = len(body.encode())
             del entry["body"]
+        if entry.get("expect"):
+            entry["files"] = await asyncio.to_thread(
+                _declared_files, tenant, entry)
     log.info("user=%s tool=collect messages=%d results=%d stopped_by=%s",
              tenant.name, len(raw), len(results), stopped_by)
     return {"results": results, "stopped_by": stopped_by}

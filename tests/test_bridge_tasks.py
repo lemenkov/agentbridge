@@ -204,6 +204,95 @@ class TextTask(TaskRun):
         self.assertNotIn("cost_usd", row)
 
 
+class DeclaredOutputs(TaskRun):
+    """The /out directory, and the verdict the host forms about it."""
+
+    def out_template(self):
+        return str(Path(self._tmp.name) / "ws" / ".outbox" / "{task_id}")
+
+    async def run_expecting(self, script, expect, task_id="T1"):
+        await self.run_one(
+            [sys.executable, "-c", f"import sys; sys.stdin.read(); {script}"],
+            "claude-text",
+            task={"body": "produce it", "task_id": task_id, "expect": expect},
+            out_template=self.out_template(),
+        )
+
+    def out_dir(self, task_id="T1"):
+        return Path(self._tmp.name) / "ws" / ".outbox" / task_id
+
+    async def test_saying_it_is_done_is_not_producing_the_file(self):
+        # The whole point of B.4: the agent reports success on stdout and
+        # writes nothing, and the task still fails.
+        await self.run_expecting(
+            "print('[RESULT] review written')", ["review.md"])
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 0)
+        self.assertEqual(done["expect"], {"review.md": "missing"})
+        self.assertFalse(done["ok"])
+
+    async def test_the_out_directory_is_created_and_passed_to_the_agent(self):
+        # The agent writes into /out via the substituted path, as a container
+        # would via its mount.
+        out = self.out_template().replace("{task_id}", "T1")
+        script = (f"open({out + '/review.md'!r}, 'w').write('a verdict')")
+        await self.run_expecting(script, ["review.md"])
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["expect"], {"review.md": "ok"})
+        self.assertTrue(done["ok"])
+        self.assertTrue(self.out_dir().is_dir())
+
+    async def test_an_empty_file_fails_the_task_despite_rc_zero(self):
+        out = self.out_template().replace("{task_id}", "T1")
+        await self.run_expecting(
+            f"open({out + '/review.md'!r}, 'w').write('')", ["review.md"])
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 0)
+        self.assertEqual(done["expect"], {"review.md": "empty"})
+        self.assertFalse(done["ok"])
+
+    async def test_the_verdict_reaches_the_ledger(self):
+        out = self.out_template().replace("{task_id}", "T1")
+        await self.run_expecting(
+            f"open({out + '/review.md'!r}, 'w').write('x')", ["review.md"])
+        row = self.ledger_lines()[0]
+        self.assertTrue(row["expect_ok"])
+        self.assertTrue(row["ok"])
+
+    async def test_a_task_id_placeholder_in_the_argv_is_substituted(self):
+        # This is how the podman -v flag gets its per-task source directory.
+        marker = str(Path(self._tmp.name) / "seen-{task_id}.txt")
+        await self.run_one(
+            [sys.executable, "-c",
+             "import sys; sys.stdin.read(); open(sys.argv[1],'w').write('hi')",
+             marker],
+            "claude-text",
+            task={"body": "x", "task_id": "T7"},
+            out_template=self.out_template(),
+        )
+        self.assertTrue((Path(self._tmp.name) / "seen-T7.txt").exists())
+
+    async def test_an_invalid_expect_list_rejects_the_task(self):
+        await self.run_one(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            "claude-text",
+            task={"body": "x", "task_id": "T1", "expect": ["../escape"]},
+            out_template=self.out_template(),
+        )
+        outputs = self.sent("researcher-1.output", "output")
+        self.assertIn("task rejected", outputs[0]["body"])
+        self.assertIn("..", outputs[0]["body"])
+        self.assertFalse(self.sent("researcher-1.output", "done")[0]["ok"])
+
+    async def test_nothing_declared_means_ok_follows_the_exit_code(self):
+        await self.run_one(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            "claude-text", out_template=self.out_template())
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertTrue(done["ok"])
+        self.assertNotIn("expect", done)
+
+
 class Failures(TaskRun):
     async def test_a_nonzero_exit_is_recorded(self):
         await self.run_one(

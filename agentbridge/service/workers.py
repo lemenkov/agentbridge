@@ -11,7 +11,7 @@ import json
 import re
 
 from ..bridge import option_args
-from . import checks, config
+from . import checks, config, workspace
 from .roles import ROLES, Role
 from .tenant import Tenant
 
@@ -65,6 +65,9 @@ def build_command(
         "--ledger-file", str(tenant.ledger),
         "--role", role_name,
         "--status-file", str(tenant.status_dir / f"{agent_id}.json"),
+        # Per-task output directory. The bridge creates it and substitutes
+        # {task_id} here and in the podman argv below.
+        "--out-template", str(tenant.workspace / workspace.OUTBOX / "{task_id}"),
         # Defaults for this worker; tasks may override them (allowlisted).
         *option_args(options),
         "--allow-task-overrides",
@@ -89,6 +92,9 @@ def build_command(
         "--secret", f"{secret},type=env,target={env_var}",
         "-v", f"{config.CLAUDE_BIN}:/usr/local/bin/claude:ro",
         "-v", f"{tenant.workspace}:/workspace:{role.workspace}",
+        # Writable even for a read-only role: that is the point — a reviewer
+        # delivers a verdict without write access to what it reviewed.
+        "-v", f"{tenant.workspace / workspace.OUTBOX}/{{task_id}}:/out:rw",
         "-w", "/workspace",
     ]
     if role.workspace == "rw" and tenant.gitconfig.exists():
