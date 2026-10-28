@@ -97,9 +97,35 @@ class Scripts(unittest.TestCase):
         self.assertFalse(sidecar["dirty"])
 
     def test_a_dirty_worktree_is_recorded_as_such(self):
-        (self.repo / "a.txt").write_text("edited\n")
+        (self.repo / "a.txt").write_text("edited\n")   # tracked, uncommitted
         [row] = self.checkpoint()["repos"]
         self.assertTrue(row["dirty"])
+
+    def test_an_untracked_file_does_not_make_it_dirty(self):
+        # Untracked files survive a rollback, so they must not veto one.
+        (self.repo / "scratch.txt").write_text("an agent's notes\n")
+        [row] = self.checkpoint()["repos"]
+        self.assertFalse(row["dirty"])
+
+    def test_a_modified_tracked_file_does_make_it_dirty(self):
+        # These are what reset --hard would discard, so they do veto it.
+        (self.repo / "a.txt").write_text("edited but not committed\n")
+        [row] = self.checkpoint()["repos"]
+        self.assertTrue(row["dirty"])
+
+    def test_a_staged_change_makes_it_dirty(self):
+        (self.repo / "c.txt").write_text("staged\n")
+        git(self.repo, "add", "c.txt")
+        [row] = self.checkpoint()["repos"]
+        self.assertTrue(row["dirty"])
+
+    def test_an_untracked_file_does_not_block_a_rollback(self):
+        (self.repo / "scratch.txt").write_text("notes\n")
+        self.checkpoint()
+        self.agent_commits()
+        [row] = self.rollback()["repos"]
+        self.assertEqual(row["status"], "reset")
+        self.assertTrue((self.repo / "scratch.txt").exists())
 
     def test_every_repository_in_the_workspace(self):
         other = self.root / "nested" / "second"

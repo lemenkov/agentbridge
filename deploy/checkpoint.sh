@@ -49,7 +49,13 @@ find "$ROOT" -maxdepth 3 -name .git -type d 2>/dev/null | sort | while read -r g
 
     head=$(GIT -C "$repo" rev-parse HEAD 2>/dev/null) || continue
     branch=$(GIT -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-    if [ -n "$(GIT -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    # --untracked-files=no on purpose. "Dirty" here must mean exactly what
+    # rollback would destroy: uncommitted changes to TRACKED files, which
+    # `reset --hard` discards. Untracked files survive a rollback (it never
+    # runs `git clean`), so counting them would veto the rollback over files
+    # that were never at risk — and an agent leaving one scratch file behind
+    # would make its own work un-undoable.
+    if [ -n "$(GIT -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
         dirty=true
     else
         dirty=false
