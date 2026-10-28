@@ -942,9 +942,12 @@ async def fetch_repo(dest: str, headers: dict = _current_headers) -> dict:
 
     log.info("user=%s tool=fetch_repo host=%s repo=%s %s", tenant.name, host,
              repo, gitcred.safe_log_fields(entry))
-    return {"dest": dest, "repo": f"{host}/{repo}",
+    # The leaf's fields first, so nothing it reports can shadow the tool's
+    # own answer: its "path" once collided with this "repo" and the result
+    # named the workspace directory as though it were the repository.
+    return {**result, "dest": dest, "repo": f"{host}/{repo}",
             "authenticated": entry is not None,
-            "working_tree_unchanged": True, **result}
+            "working_tree_unchanged": True}
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})

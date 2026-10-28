@@ -52,7 +52,7 @@ branches=$(GIT -C "$REPO" for-each-ref --format='%(refname:short)' \
 # HEAD is deliberately untouched: this updates remote-tracking refs and lets
 # the agent (or the human) decide what to merge. A fetch that moved the
 # working tree would be a different, destructive operation.
-printf '{"repo":"%s","head":"%s","head_unchanged":%s,"remote_branches":%s}\n' \
+printf '{"path":"%s","head":"%s","head_unchanged":%s,"remote_branches":%s}\n' \
     "$REL" "$after" \
     "$([ "$before" = "$after" ] && echo true || echo false)" \
     "${branches:-0}"
