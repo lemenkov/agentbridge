@@ -97,6 +97,8 @@ def provision(name: str, *, max_workers: int | None = None,
     _write_private(record_path, json.dumps(record, indent=2) + "\n", owner)
     _write_private(tenant.amqp_url_file, tenant.amqp_url + "\n", owner)
     _ensure_dir(tenant.workspace, 0o700, owner)
+    # Workers write one status file each in here (fleet_status reads them).
+    _ensure_dir(tenant.status_dir, 0o700, owner)
 
     password = None
     if reset_password or not htpasswd.has_entry(name):
@@ -130,11 +132,19 @@ def deprovision(name: str, *, purge: bool = False,
     for path in (config.TENANTS_DIR / f"{tenant.name}.json", tenant.amqp_url_file,
                  tenant.gitconfig, tenant.gitconfig.with_suffix(".gitconfig.lock")):
         path.unlink(missing_ok=True)
+    # Status files and the ledger describe a tenant that no longer exists.
+    # The ledger goes only on purge: it is the record of what was spent.
+    shutil.rmtree(tenant.status_dir, ignore_errors=True)
 
     purged = []
     if purge:
         shutil.rmtree(tenant.workspace, ignore_errors=True)
         purged.append(str(tenant.workspace))
+        for path in (tenant.ledger, tenant.ledger.with_name(tenant.ledger.name + ".1"),
+                     tenant.ledger.with_name(tenant.ledger.name + ".lock")):
+            if path.exists():
+                path.unlink(missing_ok=True)
+                purged.append(str(path))
         for kind, _ in CREDENTIAL_KINDS:
             if secrets_mod.remove(tenant.secret_name(kind), runner=secret_runner):
                 purged.append(tenant.secret_name(kind))

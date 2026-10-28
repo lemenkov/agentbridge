@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!--
+SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+SPDX-License-Identifier: Apache-2.0
+
+No inline script and no inline style: the CSP this is served with allows
+'self' only, with no unsafe-inline. Assets are separate files for that reason.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentbridge fleet</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>fleet</h1>
+  <div id="summary" class="summary">connecting…</div>
+  <label class="toggle"><input type="checkbox" id="bodies"> show agent output</label>
+  <span id="conn" class="conn" data-state="connecting">connecting</span>
+</header>
+
+<section aria-labelledby="topology-heading">
+  <h2 id="topology-heading">Topology</h2>
+  <div id="topology" class="topology"></div>
+</section>
+
+<section aria-labelledby="lanes-heading">
+  <h2 id="lanes-heading">Last 30 minutes</h2>
+  <div id="lanes" class="lanes"></div>
+</section>
+
+<section aria-labelledby="recent-heading">
+  <h2 id="recent-heading">Recent tasks</h2>
+  <table id="recent" class="recent">
+    <thead>
+      <tr>
+        <th>task</th><th>worker</th><th>role</th><th>model</th>
+        <th class="num">dur</th><th class="num">turns</th>
+        <th class="num">tokens</th><th class="num">cost</th><th>rc</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section aria-labelledby="events-heading">
+  <h2 id="events-heading">Events</h2>
+  <ol id="events" class="events" reversed></ol>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

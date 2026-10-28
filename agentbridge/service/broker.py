@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 import aio_pika
 
+from .. import status
 from ..bus import _declare_collector
 from . import config
 from .tenant import Tenant
@@ -55,6 +56,32 @@ async def publish(tenant: Tenant, routing_key: str, message: dict) -> None:
 
 def new_task_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+async def publish_dispatch(tenant: Tenant, task_id: str, to: str) -> None:
+    """Announce that a task was sent, for the fleet page's timeline.
+
+    It goes to ``orchestrator.dispatch``, which the collector's bindings do
+    not match, so this never shows up in ``collect``. It carries no body: the
+    page needs to know that a task was dispatched and where, not what it said.
+    A failure here must not fail the send that caused it — the task is already
+    on its way, and a missing tick on a page is not worth an error.
+    """
+    try:
+        async with _channel(tenant) as (_, exch):
+            await exch.publish(
+                aio_pika.Message(
+                    body=json.dumps({
+                        "type": "dispatch", "task_id": task_id, "to": to,
+                        "ts": status.now_iso(),
+                    }).encode(),
+                    # Nothing durable about a UI event.
+                    delivery_mode=aio_pika.DeliveryMode.NOT_PERSISTENT,
+                ),
+                routing_key="orchestrator.dispatch",
+            )
+    except (OSError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError):
+        pass
 
 
 async def drain(

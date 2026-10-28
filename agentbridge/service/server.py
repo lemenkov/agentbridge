@@ -21,7 +21,17 @@ from fastmcp.dependencies import CurrentHeaders
 from .. import ledger
 from ..bridge import validate_task_options
 from ..bus import fold_messages
-from . import broker, config, gitconfig, ratelimit, selfservice, workers, workspace
+from . import (
+    broker,
+    config,
+    fleet,
+    gitconfig,
+    ratelimit,
+    selfservice,
+    ui,
+    workers,
+    workspace,
+)
 from .roles import ROLES
 from .tenant import (
     TenantError,
@@ -48,6 +58,9 @@ mcp = FastMCP("agentbridge", instructions=INSTRUCTIONS)
 
 # Dependency sentinel (B008: must not call it in default arg position)
 _current_headers = CurrentHeaders()
+
+# The live fleet page: read-only routes on this same app and port.
+ui.register(mcp)
 
 
 def _fail(error: Exception | str) -> dict:
@@ -100,6 +113,31 @@ def _usage_7d(tenant) -> dict:
         # rather than a total.
         "truncated": len(recent) >= ledger.MAX_RECORDS,
     }
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def fleet_status(headers: dict = _current_headers) -> dict:
+    """What your whole fleet is doing right now, in one call.
+
+    Per worker: state (`starting`, `idle`, `working`, `retiring`, or `gone` /
+    `failed` from systemd), the task it is on and since when, the tool it last
+    called, how many tasks it has finished and the last exit code. Plus queue
+    depths, counts by state and your 7-day usage.
+
+    Metadata only and small, so it is cheap to call before deciding what to do
+    next — prefer it to `list_workers` when you want to know whether anyone is
+    busy. `gone` or `failed` means a worker died; retire it and spawn a fresh
+    one.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    units = await workers.list_units(tenant)
+    result = await fleet.snapshot(tenant, units)
+    log.info("user=%s tool=fleet_status workers=%d",
+             tenant.name, result["totals"]["workers"])
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
@@ -372,6 +410,7 @@ async def send_task(
         return _fail("`to` must be `<worker id>.inbox` or `<role>.work`")
     task_id = broker.new_task_id()
     await broker.publish(tenant, to, {"body": body, "task_id": task_id, **options})
+    await broker.publish_dispatch(tenant, task_id, to)
     log.info("user=%s tool=send_task to=%s task=%s bytes=%d options=%s", tenant.name,
              to, task_id, len(body.encode()), options or "default")
     return {"sent": True, "routing_key": to, "task_id": task_id}
@@ -395,6 +434,7 @@ async def broadcast(
     task_id = broker.new_task_id()
     await broker.publish(tenant, "orchestrator.broadcast",
                          {"body": body, "task_id": task_id, **options})
+    await broker.publish_dispatch(tenant, task_id, "orchestrator.broadcast")
     log.info("user=%s tool=broadcast task=%s bytes=%d", tenant.name, task_id,
              len(body.encode()))
     return {"sent": True, "task_id": task_id}

@@ -28,6 +28,7 @@ import aio_pika
 
 from . import ledger
 from .drivers import DEFAULT_DRIVER, DRIVERS, make_driver
+from .status import StatusWriter
 
 # stream-json's init event enumerates the agent's tools and skills; it was
 # 39 KB in a host capture, and asyncio's default 64 KiB stream limit would
@@ -121,8 +122,15 @@ async def bridge(
     ledger_file: str | None = None,
     role: str | None = None,
     backend: str = "anthropic",
+    status_file: str | None = None,
 ) -> None:
     """Run the pull-worker loop: consume tasks, run the agent, republish output."""
+
+    status = StatusWriter(
+        status_file, agent=agent_id, role=role, backend=backend,
+        options=default_options, driver=driver_name,
+    )
+    status.set("starting")
 
     connection = await aio_pika.connect_robust(amqp_url)
     channel = await connection.channel()
@@ -173,7 +181,8 @@ async def bridge(
                 "allowed" if allow_task_overrides else "refused")
     logger.info("Driver: %s | role: %s | backend: %s",
                 driver_name, role or "unset", backend)
-    logger.info("Ledger: %s", ledger_file or "off")
+    logger.info("Ledger: %s | status file: %s",
+                ledger_file or "off", status_file or "off")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -228,7 +237,9 @@ async def bridge(
                 if log_content:
                     logger.info("→ %s: %s", outbox, (event.body or "")[:80])
                 return
-            # progress: throttled, and never carrying agent text.
+            # The status file sees every tool call (it is a snapshot, not a
+            # stream, so there is nothing to flood); only the bus is throttled.
+            status.progress(event.tool, event.phase)
             now = time.monotonic()
             if counts["progress"] and (now - last_progress) < PROGRESS_INTERVAL:
                 return
@@ -335,6 +346,8 @@ async def bridge(
         except OSError as exc:
             logger.warning("Ledger append failed for task %s: %s", task_id, exc)
 
+    status.set("idle")
+
     last_activity = time.monotonic()
     idle_announced = False
     stop = False
@@ -370,6 +383,7 @@ async def bridge(
 
             if payload.get("type") == "shutdown":
                 logger.info("Shutdown requested — retiring worker %s", agent_id)
+                status.retiring()
                 stop = True
             else:
                 task = payload.get("body", "")
@@ -404,6 +418,7 @@ async def bridge(
                         start_message["task_id"] = task_id
                     await publish(progress_key, start_message)
 
+                    status.task_started(task_id, options)
                     result = await run_task(task, task_id, options)
                     rc = result["rc"]
                     duration_ms = int((time.monotonic() - started) * 1000)
@@ -442,6 +457,7 @@ async def bridge(
                 }
                 if task_id is not None:
                     done["task_id"] = task_id
+                status.task_finished(rc)
                 if result is not None:
                     # Null rather than absent when the driver could not produce
                     # them, so a collector can tell "no metrics" from "metrics
@@ -455,6 +471,7 @@ async def bridge(
         idle_announced = False
 
     await connection.close()
+    status.remove()
     logger.info("Worker %s exited", agent_id)
 
 
@@ -566,6 +583,14 @@ def main() -> None:
         help="Role name recorded in the ledger (not passed to the agent).",
     )
     parser.add_argument(
+        "--status-file",
+        default=None,
+        metavar="PATH",
+        help="Rewrite this file at every state transition (starting, idle, "
+             "working, retiring) with what this worker is doing. Metadata "
+             "only; keep it outside any workspace an agent can write to.",
+    )
+    parser.add_argument(
         "--backend",
         default="anthropic",
         help="Model backend recorded in the ledger (default: %(default)s).",
@@ -632,6 +657,7 @@ def main() -> None:
         ledger_file=args.ledger_file,
         role=args.role,
         backend=args.backend,
+        status_file=args.status_file,
     ))
 
 

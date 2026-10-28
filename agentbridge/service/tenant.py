@@ -71,6 +71,11 @@ class Tenant:
         return config.TENANTS_DIR / f"{self.name}.ledger.jsonl"
 
     @property
+    def status_dir(self) -> Path:
+        """One status file per worker, written by its bridge."""
+        return config.TENANTS_DIR / f"{self.name}.status"
+
+    @property
     def workspace(self) -> Path:
         return config.WORKSPACES_DIR / self.name
 

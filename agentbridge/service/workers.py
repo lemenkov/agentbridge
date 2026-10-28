@@ -64,6 +64,7 @@ def build_command(
         # Metadata only, and outside the workspace the agent can write.
         "--ledger-file", str(tenant.ledger),
         "--role", role_name,
+        "--status-file", str(tenant.status_dir / f"{agent_id}.json"),
         # Defaults for this worker; tasks may override them (allowlisted).
         *option_args(options),
         "--allow-task-overrides",
