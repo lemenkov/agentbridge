@@ -593,7 +593,6 @@ async def broadcast(
     return {"sent": True, "task_id": task_id}
 
 
-@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 def _declared_files(tenant, entry: dict) -> dict:
     """Return each declared output that passed: inline when small, else a ref.
 
@@ -622,6 +621,7 @@ def _declared_files(tenant, entry: dict) -> dict:
     return files
 
 
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 async def collect(
     idle: float = 30,
     done: int = 0,
