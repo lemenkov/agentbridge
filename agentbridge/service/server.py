@@ -9,6 +9,7 @@ Logging records user, tool, worker ids, byte counts and exit codes — never tas
 text, agent output, secrets, or a bus URL."""
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -460,12 +461,33 @@ async def clone_repo(url: str, dest: str, headers: dict = _current_headers) -> d
     return result
 
 
+async def _serve_both(host: str, port: int, admin_port: int) -> None:
+    """The user endpoint and, on its own port, the admin one (I-2).
+
+    Two listeners in one process: they share this host's state, so a second
+    unit would only add ways for the two to disagree. Both bind loopback;
+    which of them is reachable from outside is nginx's decision.
+    """
+    from .admin_api import admin_mcp
+
+    await asyncio.gather(
+        mcp.run_async(transport="http", host=host, port=port, show_banner=False),
+        admin_mcp.run_async(transport="http", host=host, port=admin_port,
+                            show_banner=False),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Multi-tenant MCP service running agentbridge agent fleets"
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8817")))
+    parser.add_argument(
+        "--admin-port", type=int,
+        default=int(os.environ.get("ADMIN_PORT", "8818")),
+        help="port for the admin endpoint (0 disables it entirely)",
+    )
     parser.add_argument(
         "--transport",
         choices=["stdio", "streamable-http"],
@@ -489,10 +511,16 @@ def main() -> None:
 
     logging.basicConfig(handlers=[handler], level=logging.INFO)
 
-    if args.transport == "streamable-http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
-    else:
+    if args.transport != "streamable-http":
         mcp.run(transport=args.transport)
+    elif args.admin_port:
+        log.info("serving user endpoint on %s:%d, admin on :%d",
+                 args.host, args.port, args.admin_port)
+        asyncio.run(_serve_both(args.host, args.port, args.admin_port))
+    else:
+        log.info("serving user endpoint on %s:%d, admin endpoint disabled",
+                 args.host, args.port)
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

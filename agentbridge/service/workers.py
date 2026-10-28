@@ -126,6 +126,25 @@ async def list_units(tenant: Tenant) -> list[dict]:
     return workers
 
 
+async def list_all_units() -> list[dict]:
+    """Every tenant's worker units — for the admin endpoint's `list_users`.
+
+    One `systemctl` call covers the whole service, because all workers are
+    user units of the one service user.
+    """
+    rc, out, err = await _run(
+        "systemctl", "--user", "list-units", "agentbridge-*",
+        "--all", "--output=json", "--no-pager",
+    )
+    if rc != 0:
+        raise RuntimeError(f"systemctl list-units failed: {err.strip()}")
+    return [
+        {"unit": name, "active": unit.get("active"), "sub": unit.get("sub")}
+        for unit in json.loads(out or "[]")
+        if (name := unit.get("unit", "")).endswith(".service")
+    ]
+
+
 def next_index(existing_ids: list[str], role_name: str) -> int:
     pattern = re.compile(rf"^{re.escape(role_name)}-(\d+)$")
     used = [int(m.group(1)) for i in existing_ids if (m := pattern.match(i))]

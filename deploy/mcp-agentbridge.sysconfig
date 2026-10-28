@@ -5,6 +5,11 @@
 
 HOST=127.0.0.1
 PORT=8817
+# The admin endpoint (provision_user and friends) listens separately, so a
+# prompt-injected orchestrator on the user endpoint holds no handle to it.
+# Set to 0 to disable it entirely. Both bind loopback; nginx decides what is
+# reachable from outside.
+ADMIN_PORT=8818
 MCP_TRANSPORT=streamable-http
 
 # Identity comes only from this header, which nginx sets from the Basic-auth
@@ -13,6 +18,14 @@ USER_HEADER=x-forwarded-user
 
 SERVICE_USER=agentbridge
 TENANTS_DIR=/var/lib/mcp-agentbridge/tenants
+# This service's own nginx password file (never /etc/nginx/.htpasswd-mcp).
+HTPASSWD_FILE=/var/lib/mcp-agentbridge/htpasswd/users
+
+# RabbitMQ management API, loopback only. The administrator account replaces
+# rabbitmqctl, so provisioning needs no root and no Erlang cookie. Add
+# RABBITMQ_ADMIN_USER and RABBITMQ_ADMIN_PASSWORD here; this file is
+# root:root 0600 because of them.
+RABBITMQ_API=http://127.0.0.1:15672/api
 WORKSPACES_DIR=/srv/agentbridge
 AGENTBRIDGE_HOME=/opt/mcp-servers/agentbridge
 

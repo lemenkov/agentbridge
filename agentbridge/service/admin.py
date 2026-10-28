@@ -24,11 +24,8 @@ import argparse
 import json
 import os
 import pwd
-import secrets
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 SYSCONFIG = Path(os.environ.get("SYSCONFIG_PATH", "/etc/sysconfig/mcp-agentbridge"))
@@ -116,77 +113,52 @@ def _fix_htpasswd_ownership(svc: pwd.struct_passwd) -> None:
 
 
 def cmd_provision(args: argparse.Namespace) -> None:
-    from . import config, htpasswd, rabbit_mgmt
-    from .tenant import Tenant, TenantError, validate_username
+    from . import config, provisioning
+    from .tenant import TenantError
 
-    try:
-        name = validate_username(args.user)
-    except TenantError as e:
-        sys.exit(str(e))
     svc = _service_user()
-    record_path = config.TENANTS_DIR / f"{name}.json"
-
-    if record_path.exists():
-        record = json.loads(record_path.read_text())
-        if args.max_workers is not None:
-            record.setdefault("limits", {})["max_workers"] = args.max_workers
-    else:
-        record = {
-            "vhost": f"ab-{name}",
-            "bus_user": f"ab-{name}",
-            "bus_password": secrets.token_hex(24),
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "limits": {"max_workers": args.max_workers or config.DEFAULT_MAX_WORKERS},
-        }
-    tenant = Tenant(name=name, vhost=record["vhost"], bus_user=record["bus_user"],
-                    bus_password=record["bus_password"],
-                    max_workers=record["limits"]["max_workers"])
-
-    # Broker: vhost + a user permitted on that vhost only, over the management
-    # API. Every call is a PUT, so re-running simply resyncs the broker to the
-    # record — no delete-then-recreate, as rabbitmqctl needed.
     try:
-        rabbit_mgmt.ensure_tenant(tenant.vhost, tenant.bus_user, tenant.bus_password)
-    except rabbit_mgmt.RabbitError as e:
+        result = provisioning.provision(
+            args.user, max_workers=args.max_workers,
+            admin=True if args.admin else (False if args.no_admin else None),
+            reset_password=args.reset_password,
+            owner=(svc.pw_uid, svc.pw_gid),
+        )
+    except (TenantError, provisioning.rabbit_mgmt.RabbitError) as e:
         sys.exit(str(e))
-
-    # Files: tenant record + bus URL file (0600, service user), workspace (0700).
-    config.TENANTS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chown(config.TENANTS_DIR, svc.pw_uid, svc.pw_gid)
-    _write_private(record_path, json.dumps(record, indent=2) + "\n", svc)
-    _write_private(tenant.amqp_url_file, tenant.amqp_url + "\n", svc)
-    if args.git_name and args.git_email:
-        _write_private(tenant.gitconfig,
-                       f"[user]\n\tname = {args.git_name}\n\temail = {args.git_email}\n"
-                       "[safe]\n\tdirectory = *\n", svc)
-    tenant.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chown(tenant.workspace, svc.pw_uid, svc.pw_gid)
-
-    # Login: our own password file, not the fleet-wide one. A generated
-    # password is printed once and never stored in the clear.
-    new_password = None
-    if args.reset_password or not htpasswd.has_entry(name):
-        new_password = htpasswd.generate_password()
-        htpasswd.set_entry(name, new_password)
     _fix_htpasswd_ownership(svc)
 
-    print(f"provisioned {name}: vhost {tenant.vhost}, bus user {tenant.bus_user}, "
-          f"workspace {tenant.workspace}, max_workers {tenant.max_workers}")
-    if not tenant.gitconfig.exists():
-        print("  note: no committer identity (--git-name/--git-email); "
-              "implementers will not be able to commit")
-    if new_password:
-        print(f"  login password (shown once, not stored): {new_password}")
+    # The git identity stays a CLI convenience for bootstrap; tenants set it
+    # themselves with set_git_identity.
+    if args.git_name and args.git_email:
+        from . import gitconfig
+        from .tenant import load_tenant
+
+        tenant = load_tenant(args.user)
+        gitconfig.write_identity(tenant, args.git_name, args.git_email)
+        os.chown(tenant.gitconfig, svc.pw_uid, svc.pw_gid)
+        result["has_git_identity"] = True
+
+    print(f"provisioned {result['user']}: vhost {result['vhost']}, bus user "
+          f"{result['bus_user']}, workspace {result['workspace']}, "
+          f"max_workers {result['max_workers']}"
+          + (", admin" if result["admin"] else ""))
+    if not result["has_git_identity"]:
+        print("  note: no committer identity (--git-name/--git-email, or the "
+              "tenant's own set_git_identity); implementers cannot commit")
+    if result["password"]:
+        print(f"  login password (shown once, not stored): {result['password']}")
     else:
         print(f"  login unchanged in {config.HTPASSWD_FILE} "
               f"(use --reset-password to issue a new one)")
-    print("Remaining manual step:")
+    print("Remaining manual step (or the tenant's own register_credential):")
     print(f"  runuser -u {svc.pw_name} -- env XDG_RUNTIME_DIR=/run/user/{svc.pw_uid} "
-          f"podman secret create {tenant.secret_name('apikey')} -   # or -oauth; value on stdin")
+          f"podman secret create anthropic-{result['user']}-apikey -   "
+          f"# or -oauth; value on stdin")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    from . import config, htpasswd
+    from . import provisioning
     from . import secrets as secrets_mod
 
     svc = _service_user()
@@ -197,49 +169,41 @@ def cmd_list(args: argparse.Namespace) -> None:
     units = _as_service_user(svc, "systemctl", "--user", "list-units",
                              "agentbridge-*", "--all", "--output=json", "--no-pager")
     unit_names = [u.get("unit", "") for u in json.loads(units.stdout or "[]")]
-    logins = set(htpasswd.entries())
-    print(f"{'user':<16} {'credential':<10} {'login':<6} {'workers':>7}  {'max':>3}")
-    for path in sorted(config.TENANTS_DIR.glob("*.json")):
-        name = path.stem
-        record = json.loads(path.read_text())
-        cred = next((k for k in ("apikey", "oauth")
-                     if f"anthropic-{name}-{k}" in secret_names), "-")
-        count = sum(1 for u in unit_names if u.startswith(f"agentbridge-{name}-"))
-        print(f"{name:<16} {cred:<10} {('yes' if name in logins else 'no'):<6} {count:>7}  "
-              f"{record.get('limits', {}).get('max_workers', '?'):>3}")
+    rows = provisioning.list_tenants(secret_names=secret_names, unit_names=unit_names)
+    print(f"{'user':<16} {'credential':<10} {'login':<6} {'admin':<6} "
+          f"{'workers':>7}  {'max':>3}")
+    for row in rows:
+        print(f"{row['user']:<16} {','.join(row['credentials']) or '-':<10} "
+              f"{('yes' if row['login'] else 'no'):<6} "
+              f"{('yes' if row['admin'] else 'no'):<6} "
+              f"{row['workers']:>7}  {row['max_workers'] or '?':>3}")
 
 
 def cmd_deprovision(args: argparse.Namespace) -> None:
-    from . import config, htpasswd, rabbit_mgmt
-    from . import secrets as secrets_mod
+    from . import provisioning
     from .tenant import TenantError, load_tenant
 
+    svc = _service_user()
     try:
         tenant = load_tenant(args.user)
     except TenantError as e:
         sys.exit(str(e))
-    svc = _service_user()
+    # Stop the workers before the vhost disappears under them.
     _as_service_user(svc, "systemctl", "--user", "stop", f"{tenant.unit_prefix}*")
     try:
-        rabbit_mgmt.delete_vhost(tenant.vhost)
-        rabbit_mgmt.delete_user(tenant.bus_user)
-    except rabbit_mgmt.RabbitError as e:
+        result = provisioning.deprovision(
+            args.user, purge=args.purge, secret_runner=_secret_runner(svc))
+    except (TenantError, provisioning.rabbit_mgmt.RabbitError) as e:
         sys.exit(str(e))
-    had_login = htpasswd.remove_entry(tenant.name)
     _fix_htpasswd_ownership(svc)
-    for path in (config.TENANTS_DIR / f"{tenant.name}.json", tenant.amqp_url_file,
-                 tenant.gitconfig):
-        path.unlink(missing_ok=True)
-    print(f"deprovisioned {tenant.name}: workers stopped, vhost and bus user deleted"
-          + (", login removed" if had_login else ""))
-    if args.purge:
-        shutil.rmtree(tenant.workspace, ignore_errors=True)
-        runner = _secret_runner(svc)
-        for kind in ("apikey", "oauth"):
-            secrets_mod.remove(tenant.secret_name(kind), runner=runner)
-        print(f"  purged workspace {tenant.workspace} and credential secrets")
+
+    print(f"deprovisioned {result['user']}: workers stopped, vhost and bus user "
+          f"deleted" + (", login removed" if result["login_removed"] else ""))
+    if result["purged"]:
+        print(f"  purged: {', '.join(result['purged'])}")
     else:
-        print(f"  kept workspace {tenant.workspace} and credential secrets (use --purge)")
+        print(f"  kept workspace {result['workspace_kept']} and credential "
+              f"secrets (use --purge)")
 
 
 def main() -> None:
@@ -254,6 +218,10 @@ def main() -> None:
     p.add_argument("--git-email", help="committer email for implementer commits")
     p.add_argument("--reset-password", action="store_true",
                    help="issue a new login password even if one exists")
+    p.add_argument("--admin", action="store_true",
+                   help="grant access to the admin endpoint's tools")
+    p.add_argument("--no-admin", action="store_true",
+                   help="revoke admin access")
     p.set_defaults(func=cmd_provision)
 
     p = sub.add_parser("list", help="list tenants, credentials and worker counts")

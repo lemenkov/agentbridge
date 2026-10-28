@@ -45,6 +45,9 @@ class Tenant:
     bus_user: str
     bus_password: str
     max_workers: int
+    # Admin tools are refused unless this is set in the tenant record. nginx
+    # cannot tell admins apart — it only knows logins — so the service decides.
+    admin: bool = False
 
     @property
     def amqp_url(self) -> str:
@@ -97,6 +100,7 @@ def load_tenant(name: str) -> Tenant:
         bus_password=record["bus_password"],
         max_workers=int(record.get("limits", {}).get(
             "max_workers", config.DEFAULT_MAX_WORKERS)),
+        admin=bool(record.get("admin", False)),
     )
 
 
