@@ -40,9 +40,15 @@ to a single repository, which is the whole point here.
    pick an organisation that requires approval, the token stays *pending* and
    can read only public repositories until an org admin approves it, which
    looks exactly like a broken token if you do not know to expect it.
-5. **Repository access** — two defensible answers, and the choice decides
-   what you type in step 2 as well:
-   - **Only select repositories** → one repository (or a few). Narrowest
+5. **Repository access** — **three** options, and GitHub preselects the one
+   that cannot work:
+   - **Public repositories** — the default, and **useless here**: it grants
+     read-only access to public repositories and nothing else. Worse, while
+     it is selected GitHub offers *no repository permissions at all*, so the
+     form looks complete. A token left on this setting passes every test
+     against a public repository and fails on the first private one. See
+     *The half-working token*.
+   - **Only select repositories** → one repository, or a few. Narrowest
      blast radius, and the right default for a token going onto a host that
      runs unattended agents.
    - **All repositories** → every repository the resource owner has, now and
@@ -50,12 +56,20 @@ to a single repository, which is the whole point here.
      cost of a wider blast radius — and note "in future": a repository you
      create next month is covered without you deciding anything.
 
-   Pick deliberately; both are supported end to end, and the `--match`
-   argument in step 2 has to agree with what you picked.
+   Pick deliberately; the last two are both supported end to end, and the
+   `--match` argument in step 2 has to agree with what you picked.
 6. **Permissions** → **Repository permissions** → **Contents: Read-only**.
    That is the only one needed for clone and fetch. GitHub adds
    **Metadata: Read-only** automatically and will not let you remove it; that
    is expected.
+
+   **This is a second, separate step, and it is the one people miss.** The
+   permission list only appears once *Repository access* is off *Public
+   repositories*, and everything in it then starts at **No access** — so
+   moving a token to *All repositories* grants reach without granting the
+   right to read code. Both settings have to be made, and saved. A token with
+   access but no `Contents` fails exactly like a token with no access:
+   `403 remote: Write access to repository not granted`.
 7. **Generate token**, then copy it. GitHub shows it exactly once. It starts
    with `github_pat_`.
 
