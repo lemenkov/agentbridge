@@ -211,6 +211,21 @@ and nothing in the design has to change when the App replaces it.
 
 ## If it does not work
 
+**Read the status code, not the message.** GitHub's git endpoint says
+`remote: Write access to repository not granted` for causes that have nothing
+to do with write access, and says it for `ls-remote`, `clone` and `fetch`
+alike. The code is the part that carries information:
+
+| Code | What it means |
+|---|---|
+| **401** | the credential was **not accepted** — invalid, expired, revoked, or not the token you think is registered |
+| **403** | the credential **was accepted**, then refused — it is live, but lacks `Contents: Read` or the repository is outside its selection |
+| **404** | the repository is **not visible** to this credential at all — wrong resource owner, or not in its selection |
+
+A 403 therefore *proves the registered token is live*. If a token you have just
+confirmed works returns 403 here, the question is not what it grants — it is
+whether the host is holding it. See *Which token is the host holding?*
+
 | Symptom | Likely cause |
 |---|---|
 | `unrecognised token prefix` | a password, a truncated paste, or a classic token typed where a fine-grained one was meant |
@@ -218,7 +233,8 @@ and nothing in the design has to change when the App replaces it.
 | registered against a shell-expanded name | the `owner/*` match was unquoted; `git-token-list` shows what was actually stored |
 | 401 on a repository that used to work | the token expired, or was revoked at GitHub |
 | 404 on a private repository | the token is valid but cannot see it: wrong resource owner, repository not selected under *Only select repositories*, or an org approval still pending |
-| `remote: Write access to repository not granted` + **403** on a *private* repository | **missing Contents: Read-only**, or that repository is not in the token's selection. GitHub's message is misleading: it says *write* when the missing permission is read, and says it for `ls-remote`, `clone` and `fetch` alike. See *The half-working token* |
+| `remote: Write access to repository not granted` + **403** on a *private* repository | **missing Contents: Read-only**, or that repository is not in the token's selection — or the host is holding an **older token** than the one you are looking at. All three produce this exact message. See *The half-working token* and *Which token is the host holding?* |
+| **403** on a repository whose token you have just verified by hand | the registered token is **not** the one you verified. Re-register it |
 | `Resource not accessible` | missing **Contents: Read-only** (the REST API's wording for the same cause) |
 | works for public, fails for private | **Contents: Read-only** was never granted, or the token is pending org approval — both permit public reads only. See *The half-working token* |
 
@@ -237,10 +253,16 @@ available:
 | `test_git_credential` | succeeds | **403, "Write access … not granted"** |
 | `clone_repo` | succeeds, `authenticated: true` | 403 |
 
-The public success is not meaningless: GitHub answers 401 for a public
-repository if the token is invalid or expired, so it does prove the token is
-live and that the `GIT_CONFIG_*` Authorization path reaches the forge. It says
-nothing whatsoever about private access.
+The public success is not meaningless, but it proves less than it appears to.
+GitHub answers 401 for a public repository if the token is invalid or expired,
+so a success does prove that **some live token is registered** and that the
+`GIT_CONFIG_*` Authorization path reaches the forge.
+
+It says nothing about private access, and — the part that is easy to miss —
+nothing about *which* token is registered. **Any** live token passes, including
+one you replaced weeks ago. Treating a public success as proof that the right
+credential is in place cost this project four failed attempts and three wrong
+diagnoses.
 
 **So test against a private repository, or you have tested almost nothing.**
 Observed for real on 2026-10-30: a token passed every public check, including
@@ -255,6 +277,65 @@ The fix is at GitHub, not here. Open the token at
 2. **Repository access** covers the repository — either *All repositories*, or
    that repository listed under *Only select repositories*.
 
-Editing an existing fine-grained token's permissions does **not** invalidate
-it, so nothing needs re-registering on this side afterwards: the same token
-simply starts working.
+Editing an existing fine-grained token's **permissions** does not invalidate
+it, so nothing needs re-registering afterwards: the same token simply starts
+working.
+
+**Regenerating** it is a different thing entirely — it mints a new value, and
+the old one keeps working until you revoke it. If you regenerate, you *must*
+re-register here, or the host goes on using the old token. That is the trap in
+the next section.
+
+## Which token is the host holding?
+
+**Nothing on this side can tell you.** A registration records the token's
+*kind*, inferred from its prefix, and nothing that distinguishes one
+`github_pat_` from another. The id shown by `git-token-list` ends in random
+hex generated at registration time, so a changed id means a registration was
+written — not that the value differs.
+
+So this failure mode is invisible: you edit a token at GitHub, confirm it
+works, and the host keeps using an **older token you forgot you replaced**. If
+that older token had repository access *Public repositories*, it is still live
+and still refuses every private repository — with the same misleading
+`Write access to repository not granted` as a missing permission. Observed for
+real on 2026-10-30, over four attempts.
+
+**Check the token itself before suspecting its grants.** On your own machine,
+with the value you believe is registered:
+
+```bash
+read -rs -p 'paste token: ' TOK; echo
+curl -s -D- -o /dev/null \
+     -H "Authorization: Bearer $TOK" \
+     https://api.github.com/repos/OWNER/REPO/contents/ \
+  | grep -iE '^HTTP/|^x-accepted-github-permissions'
+unset TOK
+```
+
+`read -rs` keeps the value off your screen and out of shell history. GitHub
+names the permission it wants in the response header:
+
+| Result | Meaning |
+|---|---|
+| `200` + `x-accepted-github-permissions: contents=read` | this token **can** read that repository. If the service still fails, the service is holding a different token — re-register it |
+| `403` + the same header | the grant really is missing. Fix it at GitHub |
+| `404` | this token cannot see the repository: wrong resource owner, or not in its selection |
+
+Re-registering is one command and replaces the entry for that match in place:
+
+```bash
+sudo venv/bin/agentbridge-admin git-token claude \
+    --host github.com --match 'lemenkov/*'
+```
+
+Two asides, both measured rather than assumed, in case they come up:
+
+- **The basic-auth username does not matter.** `x-access-token`, your login,
+  `git`, `oauth2` — all work. GitHub reads the password and ignores the
+  username; `x-access-token` is simply its documented convention for App
+  installation tokens. A username mismatch is never the cause.
+- **`Authorization: Bearer` does not work for git.** It is correct for
+  `api.github.com` and returns 401 on the git endpoint, so a Bearer-based
+  hand-test can fail while git succeeds. Use Basic when testing git, Bearer
+  when testing the REST API.
