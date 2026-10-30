@@ -9,6 +9,7 @@ did not ask for it.
 """
 
 import base64
+import hashlib
 import json
 import tempfile
 import unittest
@@ -356,3 +357,93 @@ class TokenWhitespace(GitCredBase):
             gitcred.add_token(self.alice, "github.com", "o/n", f" {TOKEN}")
         except gitcred.GitCredError as exc:
             self.fail(f"a leading space was rejected as a bad token: {exc}")
+
+
+class Fingerprint(GitCredBase):
+    """Which token is stored has to be answerable, or a stale one is invisible."""
+
+    def test_registration_records_a_fingerprint_matching_sha256(self):
+        entry = gitcred.add_token(self.alice, "github.com", "o/n", TOKEN)
+        expected = hashlib.sha256(TOKEN.encode()).hexdigest()[:6]
+        self.assertEqual(entry["fingerprint"], expected)
+        self.assertEqual(
+            gitcred.list_credentials(self.alice)[0]["fingerprint"], expected)
+
+    def test_whitespace_does_not_change_the_fingerprint(self):
+        # The operator compares against `printf %s "$TOKEN" | sha256sum`, which
+        # sees no whitespace, so a pasted newline must not shift the answer.
+        self.assertEqual(gitcred.token_fingerprint(f"  {TOKEN}\n"),
+                         gitcred.token_fingerprint(TOKEN))
+
+    def test_two_tokens_are_distinguishable(self):
+        other = TOKEN[:-1] + "9"
+        self.assertNotEqual(gitcred.token_fingerprint(TOKEN),
+                            gitcred.token_fingerprint(other))
+
+    def test_the_fingerprint_is_not_the_token(self):
+        entry = gitcred.add_token(self.alice, "github.com", "o/n", TOKEN)
+        self.assertNotIn(entry["fingerprint"], TOKEN)
+        self.assertEqual(len(entry["fingerprint"]), 6)
+
+    def test_backfill_fills_an_entry_registered_without_one(self):
+        gitcred.add_token(self.alice, "github.com", "o/n", TOKEN)
+        # Simulate an index written before fingerprints existed.
+        path = gitcred.cred_dir(self.alice) / "index.json"
+        entries = json.loads(path.read_text())
+        del entries[0]["fingerprint"]
+        path.write_text(json.dumps(entries))
+        self.assertIsNone(
+            gitcred.list_credentials(self.alice)[0].get("fingerprint"))
+
+        self.assertEqual(gitcred.backfill_fingerprints(self.alice), 1)
+        self.assertEqual(gitcred.list_credentials(self.alice)[0]["fingerprint"],
+                         hashlib.sha256(TOKEN.encode()).hexdigest()[:6])
+        # Idempotent: nothing left to fill.
+        self.assertEqual(gitcred.backfill_fingerprints(self.alice), 0)
+
+    def test_backfill_survives_an_unreadable_token_file(self):
+        gitcred.add_token(self.alice, "github.com", "o/n", TOKEN)
+        path = gitcred.cred_dir(self.alice) / "index.json"
+        entries = json.loads(path.read_text())
+        del entries[0]["fingerprint"]
+        path.write_text(json.dumps(entries))
+        (gitcred.cred_dir(self.alice) / f"{entries[0]['id']}.token").unlink()
+        # A listing must not become a failure because a token file is gone.
+        self.assertEqual(gitcred.backfill_fingerprints(self.alice), 0)
+        self.assertEqual(len(gitcred.list_credentials(self.alice)), 1)
+
+
+class HttpDiagnosis(unittest.TestCase):
+    """401 and 403 are different faults; GitHub's wording hides the difference."""
+
+    def test_403_says_the_credential_was_accepted_then_refused(self):
+        text = gitcred.diagnose_git_http_error(
+            "remote: Write access to repository not granted.\n"
+            "fatal: unable to access 'https://github.com/o/n.git/': "
+            "The requested URL returned error: 403")
+        self.assertIn("accepted this credential", text)
+        self.assertIn("Contents: Read-only", text)
+
+    def test_401_points_at_the_token_not_its_grants(self):
+        text = gitcred.diagnose_git_http_error(
+            "The requested URL returned error: 401")
+        self.assertIn("did not accept", text)
+        self.assertIn("fingerprint", text)
+
+    def test_404_reads_as_invisible_rather_than_forbidden(self):
+        self.assertIn("not visible", gitcred.diagnose_git_http_error(
+            "The requested URL returned error: 404"))
+
+    def test_a_prompt_fallback_is_reported_as_a_rejected_credential(self):
+        # git asks for a username after a 401 and then fails for want of a
+        # terminal; that is still a rejected credential.
+        for text in ("fatal: could not read Username for "
+                     "'https://github.com': terminal prompts disabled",
+                     "remote: Authentication failed for 'https://github.com/'"):
+            self.assertEqual(gitcred.diagnose_git_http_error(text),
+                             gitcred.HTTP_DIAGNOSIS[401])
+
+    def test_an_unrelated_failure_gets_no_diagnosis(self):
+        for text in ("", "fatal: not a git repository",
+                     "The requested URL returned error: 500"):
+            self.assertIsNone(gitcred.diagnose_git_http_error(text))

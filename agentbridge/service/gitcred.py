@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -185,6 +186,26 @@ def describe_token(token: str) -> str:
     )
 
 
+FINGERPRINT_LENGTH = 6
+
+
+def token_fingerprint(token: str) -> str:
+    """Six hex digits of sha256(token), to tell one stored token from another.
+
+    This is not a secret. Twenty-four bits of a digest of a high-entropy value
+    identify nothing on their own, and they buy the one check that is otherwise
+    impossible: `printf %s "$TOKEN" | sha256sum` against what `git-token-list`
+    prints answers "is the host holding the token I am looking at?".
+
+    Without it a stale token is invisible. It still authenticates, so it is not
+    a 401, and it then fails authorization exactly like a missing permission —
+    which is how one cost four rounds of diagnosis on 2026-10-30. The kind we
+    already record comes from the prefix, so it is identical for every
+    `github_pat_`, and the suffix in `new_id` is random per registration.
+    """
+    return hashlib.sha256(token.strip().encode()).hexdigest()[:FINGERPRINT_LENGTH]
+
+
 # ------------------------------------------------------------------- records
 
 
@@ -220,6 +241,7 @@ def add_token(tenant: Tenant, host: str, match: str, token: str,
         entry = {
             "id": cred_id, "host": host, "match": match, "kind": "token",
             "scope": scope, "token_kind": description,
+            "fingerprint": token_fingerprint(token),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         # Same (host, match, scope) replaces its predecessor: re-registering
@@ -244,6 +266,33 @@ def list_credentials(tenant: Tenant) -> list[dict]:
         {k: v for k, v in entry.items() if k != "token"}
         for entry in _read_index(tenant)
     ]
+
+
+def backfill_fingerprints(tenant: Tenant) -> int:
+    """Give entries registered before fingerprints existed one. Returns the count.
+
+    Reading the stored value is the only way to compute it, so this is kept out
+    of `list_credentials` — that function promises metadata and should not open
+    token files. The caller is the root CLI, which is also where the answer is
+    wanted.
+    """
+    with _locked(tenant):
+        entries = _read_index(tenant)
+        filled = 0
+        for entry in entries:
+            if entry.get("fingerprint") or entry.get("kind") != "token":
+                continue
+            try:
+                raw = _token_path(tenant, entry["id"]).read_text(encoding="utf-8")
+            except OSError:
+                # A missing or unreadable token file is a separate fault; do not
+                # turn a listing into a failure over it.
+                continue
+            entry["fingerprint"] = token_fingerprint(raw)
+            filled += 1
+        if filled:
+            _write_index(tenant, entries)
+    return filled
 
 
 def remove(tenant: Tenant, cred_id: str) -> bool:
@@ -320,6 +369,40 @@ def read_token(tenant: Tenant, cred_id: str) -> str:
         return _token_path(tenant, cred_id).read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise GitCredError(f"credential {cred_id!r} is unreadable: {exc}") from None
+
+
+# A status code says what the message will not. GitHub answers
+# `remote: Write access to repository not granted` when the missing right is
+# *read*, and says it for ls-remote, clone and fetch alike, so the wording
+# sends you to the wrong place. 401 and 403 are entirely different faults with
+# entirely different fixes; conflating them cost four rounds of diagnosis on
+# 2026-10-30 (PLAN.md D.4c).
+HTTP_DIAGNOSIS = {
+    401: ("the forge did not accept this credential: expired, revoked, or not "
+          "the token you believe is registered. Compare the fingerprint in "
+          "`agentbridge-admin git-token-list` against "
+          '`printf %s "$TOKEN" | sha256sum | cut -c1-6`'),
+    403: ("the forge accepted this credential and then refused the request, so "
+          "the token is live but cannot read this repository. On GitHub that "
+          "is a missing `Contents: Read-only`, or a repository outside the "
+          "token's selection. Its own message says *write*; it means read"),
+    404: ("this repository is not visible to this credential: wrong resource "
+          "owner, outside the token's selection, or it does not exist"),
+}
+
+
+def diagnose_git_http_error(stderr: str) -> str | None:
+    """The distinction git's own message hides, or None if this is not one."""
+    match = re.search(r"returned error: (\d{3})", stderr or "")
+    if match:
+        return HTTP_DIAGNOSIS.get(int(match.group(1)))
+    # On a 401 git falls back to asking for a username and then fails because
+    # no terminal is attached. That is a rejected credential, not a missing
+    # prompt, and it should read as one.
+    if any(s in (stderr or "") for s in
+           ("could not read Username", "Authentication failed")):
+        return HTTP_DIAGNOSIS[401]
+    return None
 
 
 # --------------------------------------------------------------- git plumbing

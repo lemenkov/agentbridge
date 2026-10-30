@@ -77,8 +77,13 @@ _current_headers = CurrentHeaders()
 ui.register(mcp)
 
 
-def _fail(error: Exception | str) -> dict:
-    return {"success": False, "error": str(error)}
+def _fail(error: Exception | str, hint: str | None = None) -> dict:
+    out = {"success": False, "error": str(error)}
+    if hint:
+        # A separate key, not an appended string: the caller reads the error to
+        # see what git said and the diagnosis to see what it means.
+        out["diagnosis"] = hint
+    return out
 
 
 async def _credential(tenant):
@@ -873,7 +878,7 @@ async def clone_repo(url: str, dest: str, headers: dict = _current_headers) -> d
         env = gitcred.git_env(tenant, entry)
         result = await workspace.clone(tenant, url, dest, env=env)
     except (TenantError, WorkspaceError, gitcred.GitCredError) as e:
-        return _fail(e)
+        return _fail(e, gitcred.diagnose_git_http_error(str(e)))
     log.info("user=%s tool=clone_repo host=%s repo=%s %s", tenant.name, host,
              repo, gitcred.safe_log_fields(entry))
     if result.get("repaired"):
@@ -938,7 +943,9 @@ async def fetch_repo(dest: str, headers: dict = _current_headers) -> dict:
         argv = checkpoint_mod.fetch_command(tenant, role, rel, str(mirror))
         result = await checkpoint_mod.run_leaf(argv)
     except (gitcred.GitCredError, checkpoint_mod.CheckpointError) as e:
-        return _fail(e)
+        # update_mirror is the authenticated step, so a forge rejection
+        # surfaces here rather than from the sandboxed leaf.
+        return _fail(e, gitcred.diagnose_git_http_error(str(e)))
     if result.get("error"):
         return _fail(f"the fetch leaf failed: {result['error']}")
 
@@ -984,8 +991,13 @@ async def test_git_credential(
              tenant.name, host, repo, proc.returncode, fields)
     if proc.returncode != 0:
         # stderr from git can echo the URL but never the header we set.
-        return {"success": False, "repo": f"{host}/{repo}", **fields,
-                "error": err.decode(errors="replace").strip()[-400:]}
+        stderr = err.decode(errors="replace").strip()
+        out = {"success": False, "repo": f"{host}/{repo}", **fields,
+               "error": stderr[-400:]}
+        diagnosis = gitcred.diagnose_git_http_error(stderr)
+        if diagnosis:
+            out["diagnosis"] = diagnosis
+        return out
     return {"ok": True, "repo": f"{host}/{repo}", **fields,
             "branches": len([ln for ln in out.decode().splitlines() if ln.strip()])}
 

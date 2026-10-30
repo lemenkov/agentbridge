@@ -208,16 +208,27 @@ def cmd_git_token_list(args: argparse.Namespace) -> None:
     from .tenant import TenantError, load_tenant
 
     try:
-        entries = gitcred.list_credentials(load_tenant(args.user))
+        tenant = load_tenant(args.user)
+        # Entries registered before fingerprints existed get one here, so the
+        # column is useful on an established host and not only after a
+        # re-registration.
+        gitcred.backfill_fingerprints(tenant)
+        entries = gitcred.list_credentials(tenant)
     except TenantError as e:
         sys.exit(str(e))
     if not entries:
         print("no git credentials")
         return
-    print(f"{'id':<40} {'host':<16} {'match':<28} {'scope':<6} kind")
+    print(f"{'id':<40} {'host':<16} {'match':<28} {'scope':<6} "
+          f"{'print':<7} kind")
     for e in entries:
         print(f"{e['id']:<40} {e['host']:<16} {e['match']:<28} "
-              f"{e.get('scope', 'read'):<6} {e.get('token_kind', '?')}")
+              f"{e.get('scope', 'read'):<6} {e.get('fingerprint', '-'):<7} "
+              f"{e.get('token_kind', '?')}")
+    # The column is only useful with the comparison spelled out: the whole
+    # point is to catch a host still holding a token you have since replaced.
+    print("\nto check which token that is:  "
+          'printf %s "$TOKEN" | sha256sum | cut -c1-6')
 
 
 def cmd_git_token_remove(args: argparse.Namespace) -> None:
