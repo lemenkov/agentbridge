@@ -130,6 +130,11 @@ routing key: researcher-01.inbox    body: {"body": "<task text>"}
   task message may carry `"model"` / `"effort"` to override them for that task;
   values are allowlisted (model alias or `claude-…` id; effort `low`…`max`), and
   a task with an invalid value is refused with `rc=2` instead of being run.
+- `--model-allow NAME` (repeatable) replaces that Claude-name pattern with an
+  explicit list, for a backend whose model names are not Anthropic's —
+  `qwen3-coder` matches no plausible pattern, and widening the pattern until it
+  fits would widen it until anything fits. The list comes from the operator's
+  configuration, never from a task, so validation stays a closed set.
 - Each stdout line is published as its own `{"type": "output"}` message; when
   the agent exits, the bridge publishes `{"type": "done", "rc": N}` on the same
   outbox. A task may carry a `"task_id"`, which is echoed on its output and
@@ -164,6 +169,19 @@ work starts afterwards. With a subscription credential the cost figure is
 claude's own estimate rather than money billed, so the token limit is the one
 measuring something real there; cache reads are excluded from it.
 
+**Model backends.** Where a worker's `claude` sends its requests is a
+server-side choice, read from `/etc/mcp-agentbridge/backends.toml`
+(root-owned, 0644, **no secrets** — a backend needing a token names an
+operator podman secret). Without that file the hosted Anthropic API is the
+only backend, which is the default and currently the only kind `spawn_worker`
+accepts; `ollama` and `anthropic-compatible` can be declared and appear in
+`list_backends`, and spawning on one is refused until the local-inference work
+lands. `list_backends` reports each backend's kind, models and endpoint URLs;
+`spawn_worker(role, backend=…)` picks one, defaulting to the role's.
+A definition the loader cannot vouch for stops the service at startup with the
+reason, rather than producing workers that spawn and then fail every task.
+See [deploy/backends.toml.example](deploy/backends.toml.example).
+
 **Private repositories.** Register a fine-grained forge token per tenant and
 `clone_repo` uses it automatically:
 
@@ -183,6 +201,16 @@ git invocation through `GIT_CONFIG_*`. `list_git_credentials` and
 `test_git_credential` let a tenant see and check what they have without ever
 seeing a value. Read and write are separate credentials: `clone_repo` can only
 use a read one.
+
+`git-token-list` prints a short `sha256` prefix of each stored token, so
+"is the host holding the token I am looking at?" can be answered against
+`printf %s "$TOKEN" | sha256sum | cut -c1-6`. Without it a token you replaced
+at the forge but never re-registered is invisible: it still authenticates, and
+then fails authorization exactly like a missing permission. For the same
+reason the git tools classify the forge's reply — **401** credential not
+accepted, **403** accepted but not authorized, **404** not visible — because
+GitHub answers `remote: Write access to repository not granted` when the
+missing right is *read*.
 
 `fetch_repo` refreshes an existing clone in two steps, for one reason: the
 authenticated fetch runs on the host into a bare mirror the service owns, and a
@@ -238,12 +266,14 @@ read it back, and it is written whether or not anyone calls `collect`. Workers
 run claude through a `stream-json` driver, which is also what makes tool-call
 progress available on `{agent}.progress`.
 
-Tools: `whoami`, `list_roles`, `spawn_worker`, `list_workers`, `send_task`,
-`broadcast`, `collect`, `retire_worker`, `retire_all`, `workspace_ls`,
-`workspace_read`, `workspace_write`, `clone_repo`, `fleet_status`,
-`run_check`, `check_result`, `task_history`, `usage_summary`, plus
-`register_credential`, `revoke_credential`, `set_password` and
-`set_git_identity` for your own account. Roles, images and mounts are
+Tools: `whoami`, `list_roles`, `list_backends`, `spawn_worker`,
+`list_workers`, `send_task`, `broadcast`, `collect`, `retire_worker`,
+`retire_all`, `workspace_ls`, `workspace_read`, `workspace_write`,
+`clone_repo`, `fetch_repo`, `rollback_workspace`, `list_git_credentials`,
+`test_git_credential`, `fleet_status`, `run_check`, `check_result`,
+`task_history`, `usage_summary`, plus `register_credential`,
+`revoke_credential`, `set_password` and `set_git_identity` for your own
+account. Roles, images and mounts are
 server-side allowlists; no tool argument is a host path, image or flag. Leaves
 use rootless default networking (no `--network=host`), so they cannot reach
 host loopback services.
@@ -273,9 +303,11 @@ process on the host can act as any tenant.
 
 ## Requirements
 
-- Python 3.10+
+- Python **3.11+** (`tomllib`, used to read `backends.toml`)
 - RabbitMQ
-- `aio-pika`
+- `aio-pika` — the only dependency the bridge itself needs
+- `mcp` (extra) for the MCP service, `systemd-python` (extra, optional) for
+  journald logging; the bridge falls back to stderr without it
 
 ## License
 

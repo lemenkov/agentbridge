@@ -10,7 +10,11 @@ name = "agentbridge"
 version = "0.1.0"
 description = "Multi-agent orchestration bridge connecting AI agents via message bus"
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.11 for tomllib, which backends.py uses to read backends.toml, and which
+# server.py imports unconditionally. Python 3.10 reaches end of security
+# support in October 2026, so the alternative -- a tomli dependency for
+# 3.10 only -- buys nothing.
+requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Peter Lemenkov", email = "lemenkov@gmail.com" }]
 dependencies = [
