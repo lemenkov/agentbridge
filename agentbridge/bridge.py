@@ -22,7 +22,7 @@ import re
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import aio_pika
@@ -80,12 +80,30 @@ MODEL_RE = re.compile(r"^(fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,63
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
-def validate_task_options(model: str | None, effort: str | None) -> dict[str, str]:
+def validate_task_options(
+    model: str | None,
+    effort: str | None,
+    allowed: Sequence[str] | None = None,
+) -> dict[str, str]:
     """Return the validated ``{"model": ..., "effort": ...}`` subset that is set;
-    raise ``ValueError`` naming the bad value otherwise."""
+    raise ``ValueError`` naming the bad value otherwise.
+
+    ``allowed`` replaces the Claude-name pattern with an explicit allowlist, for
+    a backend whose model names are not Anthropic's — ``qwen3-coder`` and
+    ``gpt-oss:20b`` match no plausible ``MODEL_RE``, and loosening the pattern
+    to admit them would admit anything. The allowlist comes from the operator's
+    `backends.toml`, never from a task, so this stays what it was: a closed set
+    of values a task sender may pick from.
+    """
     options = {}
     if model is not None:
-        if not isinstance(model, str) or not MODEL_RE.match(model):
+        if allowed is not None:
+            if not isinstance(model, str) or model not in allowed:
+                raise ValueError(
+                    f"invalid model {model!r}: this worker's backend allows "
+                    f"{', '.join(allowed) if allowed else 'no models'}"
+                )
+        elif not isinstance(model, str) or not MODEL_RE.match(model):
             raise ValueError(
                 f"invalid model {model!r}: use an alias (fable, opus, sonnet, "
                 f"haiku) or a full model id such as claude-opus-5-5"
@@ -126,6 +144,7 @@ async def bridge(
     log_content: bool = False,
     default_options: dict[str, str] | None = None,
     allow_task_overrides: bool = False,
+    model_allow: Sequence[str] | None = None,
     driver_name: str = DEFAULT_DRIVER,
     ledger_file: str | None = None,
     role: str | None = None,
@@ -189,8 +208,9 @@ async def bridge(
     logger.info("Default options: %s | per-task overrides: %s",
                 " ".join(option_args(default_options or {})) or "none",
                 "allowed" if allow_task_overrides else "refused")
-    logger.info("Driver: %s | role: %s | backend: %s",
-                driver_name, role or "unset", backend)
+    logger.info("Driver: %s | role: %s | backend: %s | models: %s",
+                driver_name, role or "unset", backend,
+                ", ".join(model_allow) if model_allow else "claude names")
     logger.info("Ledger: %s | status file: %s | /out: %s | checkpoint: %s",
                 ledger_file or "off", status_file or "off",
                 out_template or "off",
@@ -477,7 +497,8 @@ async def bridge(
                 elif requested:
                     try:
                         options.update(validate_task_options(
-                            requested.get("model"), requested.get("effort")))
+                            requested.get("model"), requested.get("effort"),
+                            model_allow))
                     except ValueError as exc:
                         error = str(exc)
 
@@ -654,6 +675,16 @@ def main() -> None:
              "`--model MODEL` (an alias such as opus, or a full model id).",
     )
     parser.add_argument(
+        "--model-allow",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Validate --model and per-task overrides against this exact name "
+             "rather than against Claude's naming pattern (repeatable). For a "
+             "non-Anthropic backend, whose model names the pattern would "
+             "reject: `--model-allow qwen3-coder --model-allow gpt-oss:20b`.",
+    )
+    parser.add_argument(
         "--effort",
         default=None,
         choices=EFFORT_LEVELS,
@@ -740,7 +771,8 @@ def main() -> None:
 
     try:
         amqp_url = resolve_amqp_url(args.amqp_url, args.amqp_url_file, os.environ)
-        default_options = validate_task_options(args.model, args.effort)
+        default_options = validate_task_options(
+            args.model, args.effort, args.model_allow or None)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -791,6 +823,7 @@ def main() -> None:
         log_content=args.log_content,
         default_options=default_options,
         allow_task_overrides=args.allow_task_overrides,
+        model_allow=args.model_allow or None,
         driver_name=args.driver,
         ledger_file=args.ledger_file,
         role=args.role,

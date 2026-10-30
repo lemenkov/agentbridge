@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Which model backends exist. Install as /etc/mcp-agentbridge/backends.toml,
+# root-owned and 0644.
+#
+#   install -o root -g root -m 0644 deploy/backends.toml.example \
+#       /etc/mcp-agentbridge/backends.toml
+#
+# This file holds NO SECRETS and is world-readable on purpose: both the service
+# and agentbridge-netpolicy read it. A backend needing a token names an
+# operator podman secret in `credential`; the value stays in podman.
+#
+# There is no need for this file at all. Without it the service offers the
+# hosted Anthropic API and nothing else, which is the only backend that works
+# today -- `ollama` and `anthropic-compatible` can be declared and listed, but
+# spawn_worker refuses them until PLAN.md build step 12 lands.
+#
+# A definition this file cannot vouch for stops the service at startup, with
+# the reason in the journal. That is deliberate: a worker that spawns against a
+# broken backend fails every task it is given, which is far harder to diagnose.
+
+# The hosted API. Present whether or not it appears here; list it only to pin
+# `tenants` or `task_timeout` on it. It takes no endpoints and no models --
+# Anthropic validates its own model names, and a list here would be a second
+# place to keep in step with them.
+[anthropic]
+kind = "anthropic"
+
+# A local Ollama host. No credential: Ollama has no authentication, which is
+# exactly why its endpoints must stay on the LAN or a VPN (invariant I-5).
+#[ollama]
+#kind = "ollama"
+#models = ["qwen3-coder", "gpt-oss:20b"]   # required; the bridge allows only these
+#default_model = "qwen3-coder"             # optional; defaults to models[0]
+#task_timeout = 900                        # optional; overrides the bridge default
+#endpoints = [
+#    { url = "http://mini.lan:11434", max_workers = 2 },
+#    { url = "http://10.8.0.5:11434", max_workers = 1 },   # a box over the VPN
+#]
+
+# A hosted Messages-API-compatible service. `credential` names an operator
+# podman secret, injected as an environment secret and never as argv. The leaf
+# can read that token; that is the accepted residual risk the model gateway
+# (PLAN.md E.7) removes.
+#[gateway-x]
+#kind = "anthropic-compatible"
+#models = ["some-model"]
+#credential = "backend-gateway-x-token"
+#tenants = ["claude"]                      # omit for every tenant
+#endpoints = [ { url = "https://api.example.net" } ]
+
+# Rules the loader enforces, so none of this fails silently:
+#
+#   * `kind` is one of anthropic, ollama, anthropic-compatible.
+#   * ollama and anthropic-compatible need non-empty `models` and `endpoints`.
+#   * anthropic-compatible needs a `credential`; the other kinds may not have
+#     one.
+#   * anthropic takes no `endpoints`, `models` or `default_model`.
+#   * An endpoint url is scheme://host[:port] and nothing else -- no path,
+#     query, fragment or userinfo. Callers append their own paths
+#     ("/api/tags", "/v1/models"), and userinfo would be a credential in a
+#     world-readable file.
+#   * http:// to a public IP literal is refused; use https://. A hostname is
+#     not resolved here, because that would make startup depend on DNS and the
+#     answer could change afterwards anyway -- the nftables allowlist (0.1b) is
+#     what actually confines where a leaf can connect. The exception is a
+#     backend with a `credential`, where plaintext to an unresolvable name is
+#     refused outright rather than given the benefit of the doubt.
+#   * An unknown key is an error, not a warning: a typo that is ignored is a
+#     setting you believe is in force.

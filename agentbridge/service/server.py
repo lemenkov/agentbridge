@@ -23,6 +23,7 @@ from .. import ledger
 from ..bridge import validate_task_options
 from ..bus import fold_messages
 from . import (
+    backends,
     broker,
     budget,
     checks,
@@ -116,6 +117,12 @@ async def whoami(headers: dict = _current_headers) -> dict:
         # having to guess (set it with set_git_identity).
         "git_identity": gitconfig.read_identity(tenant),
         "max_workers": tenant.max_workers,
+        # Which backends this tenant may spawn on, so the question does not
+        # need a second call. `anthropic` appears only with a credential
+        # registered, because without one it cannot in fact be used.
+        "backends_available": sorted(
+            name for name, b in backends.for_tenant(tenant.name).items()
+            if b.kind != "anthropic" or credential is not None),
         "workers": await workers.list_units(tenant),
         # What this week cost, so the question "am I spending anything?" does
         # not need a second tool call.
@@ -524,10 +531,44 @@ async def list_roles() -> dict:
     return {
         "roles": {
             name: {"description": r.description, "workspace": r.workspace,
-                   "image": r.image}
+                   "image": r.image, "default_backend": r.default_backend}
             for name, r in ROLES.items()
         }
     }
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+async def list_backends(headers: dict = _current_headers) -> dict:
+    """Where workers can send their requests, and which models each accepts.
+
+    Backends a backend is not available to you are omitted. `anthropic` is the
+    hosted API under your own credential and accepts any current Claude model
+    name; a backend with a `models` list accepts only those names, and
+    `spawn_worker` refuses anything else rather than letting the worker fail
+    its first task.
+    """
+    try:
+        tenant = tenant_from_headers(headers)
+    except TenantError as e:
+        return _fail(e)
+    out = {}
+    for name, backend in sorted(backends.for_tenant(tenant.name).items()):
+        out[name] = {
+            "kind": backend.kind,
+            # Empty means "whatever the provider accepts", which is only true
+            # of the hosted API; it validates its own names.
+            "models": list(backend.models),
+            "default_model": backend.default_model,
+            "task_timeout": backend.task_timeout,
+            # A URL only, never a credential: `credential` names an operator
+            # podman secret and its value never leaves the host.
+            "endpoints": [e.url for e in backend.endpoints],
+            # Honest about today: the registry can describe a local backend
+            # before the spawn path can use one.
+            "spawnable": backend.kind == "anthropic",
+        }
+    log.info("user=%s tool=list_backends count=%d", tenant.name, len(out))
+    return {"backends": out}
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
@@ -538,6 +579,7 @@ async def spawn_worker(
     pool: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    backend: str | None = None,
     headers: dict = _current_headers,
 ) -> dict:
     """Start `count` workers of `role` (see list_roles). Each worker is a
@@ -552,14 +594,41 @@ async def spawn_worker(
     latest of a family (fable, opus, sonnet, haiku) or a full model id such as
     claude-opus-5-5; effort is low, medium, high, xhigh or max. Omitted, claude
     uses its own defaults. A single task can override both (see send_task).
+
+    `backend` chooses where the workers send their requests (see
+    list_backends); omitted, the role's default is used, which is the hosted
+    Anthropic API.
     """
     try:
         tenant = tenant_from_headers(headers)
-        options = validate_task_options(model, effort)
-    except (TenantError, ValueError) as e:
+    except TenantError as e:
         return _fail(e)
     if role not in ROLES:
         return _fail(f"unknown role {role!r}; available: {', '.join(ROLES)}")
+
+    try:
+        chosen = backends.get(backend or ROLES[role].default_backend)
+    except backends.BackendError as e:
+        return _fail(e)
+    if not chosen.allows(tenant.name):
+        # Say it is not yours rather than that it does not exist: the operator
+        # chose the restriction and a caller cannot act on a lie.
+        return _fail(f"backend {chosen.name!r} is not available to "
+                     f"{tenant.name!r}")
+    if chosen.kind != "anthropic":
+        # The registry can describe a local backend before the spawn path can
+        # use one. Saying so is better than spawning a worker that fails every
+        # task it is given.
+        return _fail(
+            f"backend {chosen.name!r} is kind {chosen.kind!r}, which this "
+            f"service can describe but not yet spawn on — only 'anthropic' "
+            f"works today (PLAN.md build step 12)")
+
+    try:
+        options = validate_task_options(
+            model, effort, list(chosen.models) or None)
+    except ValueError as e:
+        return _fail(e)
     if count < 1:
         return _fail("count must be at least 1")
     credential = await _credential(tenant)
@@ -597,9 +666,10 @@ async def spawn_worker(
             "model": options.get("model"),
             "effort": options.get("effort"),
         })
-    log.info("user=%s tool=spawn_worker role=%s workers=%s options=%s", tenant.name,
-             role, ",".join(w["id"] for w in started), options or "default")
-    return {"workers": started}
+    log.info("user=%s tool=spawn_worker role=%s backend=%s workers=%s options=%s",
+             tenant.name, role, chosen.name,
+             ",".join(w["id"] for w in started), options or "default")
+    return {"workers": started, "backend": chosen.name}
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
@@ -1051,6 +1121,16 @@ def main() -> None:
         handler = logging.StreamHandler(sys.stderr)
 
     logging.basicConfig(handlers=[handler], level=logging.INFO)
+
+    # Load the backend registry before serving. A bad backends.toml should stop
+    # the service here, with the reason in the journal, rather than surface at
+    # the first spawn_worker as a worker that cannot run anything.
+    try:
+        registry = backends.backends(reload=True)
+    except backends.BackendError as exc:
+        sys.exit(f"{config.BACKENDS_FILE}: {exc}")
+    log.info("backends: %s", ", ".join(
+        f"{name}({b.kind})" for name, b in sorted(registry.items())))
 
     if args.transport != "streamable-http":
         mcp.run(transport=args.transport)

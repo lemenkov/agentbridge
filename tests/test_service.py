@@ -196,5 +196,99 @@ class Roles(unittest.TestCase):
             self.assertTrue((images / f"{name}.Containerfile").is_file(), role.image)
 
 
+class BackendSelection(TenantDirs):
+    """Choosing a backend, and refusing clearly when one cannot be used.
+
+    Every refusal here happens before the credential lookup and before podman
+    is touched, which is the point: a worker that spawns against a backend it
+    cannot use fails its first task instead, and that is much harder to read.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from agentbridge.service import backends, server
+        self.backends, self.server = backends, server
+        self.headers = {config.USER_HEADER: "alice"}
+        registry = {
+            "anthropic": backends.ANTHROPIC,
+            "ollama": backends.Backend(
+                name="ollama", kind="ollama", models=("qwen3-coder",),
+                default_model="qwen3-coder",
+                endpoints=(backends.Endpoint(url="http://10.0.0.2:11434"),)),
+            "private": backends.Backend(
+                name="private", kind="anthropic", tenants=("bob",)),
+        }
+        patch = mock.patch.object(backends, "_cache", registry)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def spawn(self, **kwargs):
+        return asyncio.run(self.server.spawn_worker(
+            role="researcher", headers=self.headers, **kwargs))
+
+    def test_an_unknown_backend_names_what_the_host_has(self):
+        out = self.spawn(backend="nope")
+        self.assertFalse(out["success"])
+        self.assertIn("unknown backend", out["error"])
+        self.assertIn("anthropic", out["error"])
+
+    def test_a_backend_another_tenant_owns_is_refused_as_unavailable(self):
+        # Not "unknown": the operator chose the restriction, and a caller
+        # cannot act on a lie about what exists.
+        out = self.spawn(backend="private")
+        self.assertFalse(out["success"])
+        self.assertIn("not available", out["error"])
+
+    def test_a_non_anthropic_backend_is_refused_for_now_and_says_so(self):
+        out = self.spawn(backend="ollama")
+        self.assertFalse(out["success"])
+        self.assertIn("ollama", out["error"])
+        self.assertIn("anthropic", out["error"])
+
+    def test_a_model_the_backend_does_not_list_is_refused(self):
+        # anthropic has no `models`, so Claude's own pattern still applies.
+        out = self.spawn(model="qwen3-coder")
+        self.assertFalse(out["success"])
+        self.assertIn("invalid model", out["error"])
+
+    def test_an_unknown_role_is_still_caught_first(self):
+        out = asyncio.run(self.server.spawn_worker(
+            role="nonesuch", headers=self.headers))
+        self.assertIn("unknown role", out["error"])
+
+    def test_list_backends_hides_what_the_tenant_may_not_use(self):
+        out = asyncio.run(self.server.list_backends(headers=self.headers))
+        self.assertIn("anthropic", out["backends"])
+        self.assertIn("ollama", out["backends"])
+        self.assertNotIn("private", out["backends"])
+
+    def test_list_backends_says_which_are_spawnable_today(self):
+        out = asyncio.run(self.server.list_backends(headers=self.headers))
+        self.assertTrue(out["backends"]["anthropic"]["spawnable"])
+        self.assertFalse(out["backends"]["ollama"]["spawnable"])
+
+    def test_list_backends_reports_endpoints_as_urls_only(self):
+        out = asyncio.run(self.server.list_backends(headers=self.headers))
+        self.assertEqual(out["backends"]["ollama"]["endpoints"],
+                         ["http://10.0.0.2:11434"])
+        self.assertNotIn("credential", out["backends"]["ollama"])
+
+    def test_list_backends_carries_the_model_list(self):
+        out = asyncio.run(self.server.list_backends(headers=self.headers))
+        self.assertEqual(out["backends"]["ollama"]["models"], ["qwen3-coder"])
+        self.assertEqual(out["backends"]["ollama"]["default_model"],
+                         "qwen3-coder")
+        # The hosted API validates its own names, so an empty list here means
+        # "whatever Anthropic accepts", not "nothing".
+        self.assertEqual(out["backends"]["anthropic"]["models"], [])
+
+    def test_every_role_defaults_to_a_backend_that_exists(self):
+        for name, role in ROLES.items():
+            self.assertIn(role.default_backend, self.backends.backends(),
+                          f"role {name} defaults to a backend that is not "
+                          f"defined")
+
+
+
 if __name__ == "__main__":
     unittest.main()

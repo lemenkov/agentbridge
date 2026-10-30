@@ -22,7 +22,8 @@ from agentbridge.service.admin_api import admin_mcp
 from agentbridge.service.server import mcp
 
 USER_TOOLS = {
-    "whoami", "list_roles", "spawn_worker", "list_workers", "send_task",
+    "whoami", "list_roles", "list_backends", "spawn_worker", "list_workers",
+    "send_task",
     "broadcast", "collect", "retire_worker", "retire_all",
     "workspace_ls", "workspace_read", "workspace_write", "clone_repo",
     "register_credential", "revoke_credential", "set_password",

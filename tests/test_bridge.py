@@ -67,3 +67,64 @@ class TaskOptions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelAllowlist(unittest.TestCase):
+    """A backend whose model names are not Anthropic's still needs a closed set.
+
+    `qwen3-coder` and `gpt-oss:20b` match no plausible MODEL_RE, and widening
+    the pattern until they fit would widen it until anything fits. So the
+    pattern is replaced by an explicit list, which comes from the operator's
+    backends.toml and never from a task.
+    """
+
+    ALLOW = ("qwen3-coder", "gpt-oss:20b")
+
+    def test_an_allowlisted_name_is_accepted(self):
+        for model in self.ALLOW:
+            self.assertEqual(validate_task_options(model, None, self.ALLOW),
+                             {"model": model})
+
+    def test_a_claude_name_is_refused_when_an_allowlist_is_given(self):
+        # The worker is pinned to one backend; a Claude alias would be sent to
+        # an endpoint that has never heard of it.
+        for model in ("opus", "claude-opus-5-5"):
+            with self.assertRaises(ValueError):
+                validate_task_options(model, None, self.ALLOW)
+
+    def test_the_allowlist_is_exact_not_a_prefix_or_substring(self):
+        for model in ("qwen3", "qwen3-coder:latest", "QWEN3-CODER",
+                      "qwen3-coder --effort max", "gpt-oss"):
+            with self.assertRaises(ValueError):
+                validate_task_options(model, None, self.ALLOW)
+
+    def test_injection_is_still_refused_under_an_allowlist(self):
+        for model in ("--dangerously-skip-permissions", "", 42, None.__class__):
+            with self.assertRaises(ValueError):
+                validate_task_options(model, None, self.ALLOW)
+
+    def test_an_empty_allowlist_refuses_everything(self):
+        # It must not fall through to MODEL_RE: a backend that declares no
+        # models can run none. (No --model-allow at all passes None, which is
+        # the Claude-names default.)
+        with self.assertRaises(ValueError):
+            validate_task_options("opus", None, [])
+
+    def test_no_allowlist_keeps_the_claude_pattern(self):
+        self.assertEqual(validate_task_options("opus", None, None),
+                         {"model": "opus"})
+        with self.assertRaises(ValueError):
+            validate_task_options("qwen3-coder", None, None)
+
+    def test_the_error_names_what_is_allowed(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_task_options("opus", None, self.ALLOW)
+        for name in self.ALLOW:
+            self.assertIn(name, str(caught.exception))
+
+    def test_effort_validation_is_unaffected(self):
+        self.assertEqual(
+            validate_task_options("qwen3-coder", "high", self.ALLOW),
+            {"model": "qwen3-coder", "effort": "high"})
+        with self.assertRaises(ValueError):
+            validate_task_options("qwen3-coder", "extreme", self.ALLOW)

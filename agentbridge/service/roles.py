@@ -17,6 +17,11 @@ class Role:
     image: str          # local image in the service user's podman store
     workspace: str      # "ro" or "rw"
     description: str
+    # Where this role's workers send their requests when the caller does not
+    # say. Every role is on the hosted API until a local backend has passed
+    # the hardware gate (PLAN.md E.5); routing a role elsewhere is build
+    # step 13, and is a one-line change here when it comes.
+    default_backend: str = "anthropic"
 
     @property
     def preamble_files(self) -> list[Path]:

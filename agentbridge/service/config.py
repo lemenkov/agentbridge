@@ -28,6 +28,13 @@ EXCHANGE = os.environ.get("AGENTBRIDGE_EXCHANGE", "agents")
 # which file to edit.
 SYSCONFIG_PATH = os.environ.get("SYSCONFIG_PATH", "/etc/sysconfig/mcp-agentbridge")
 
+# Which model backends exist (E.2). Root-owned, 0644, no secrets: a backend
+# needing a token names an operator podman secret instead. Absent means the
+# hosted Anthropic API and nothing else, which is every host until an
+# operator writes the file.
+BACKENDS_FILE = Path(os.environ.get(
+    "BACKENDS_FILE", "/etc/mcp-agentbridge/backends.toml"))
+
 # RabbitMQ management API: loopback only (plan 0.1a), reached with an
 # administrator account instead of rabbitmqctl's Erlang cookie (plan 0.4).
 RABBITMQ_API = os.environ.get("RABBITMQ_API", "http://127.0.0.1:15672/api")
