@@ -890,7 +890,9 @@ async def list_git_credentials(headers: dict = _current_headers) -> dict:
 
     Registering one is the operator's job, deliberately: a token passed as a
     tool argument would be recorded in this conversation. Ask them to run
-    `agentbridge-admin git-token add <you> --host github.com --match owner/name`.
+    `agentbridge-admin git-token <you> --host github.com --match owner/name`
+    as root; `docs/github-token.md` is the full instruction. Do not offer to
+    accept the token yourself — in this conversation it would be disclosed.
     """
     try:
         tenant = tenant_from_headers(headers)

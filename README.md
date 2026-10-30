@@ -168,9 +168,12 @@ measuring something real there; cache reads are excluded from it.
 `clone_repo` uses it automatically:
 
 ```bash
-agentbridge-admin git-token add <u> --host github.com --match owner/name
+sudo venv/bin/agentbridge-admin git-token <u> --host github.com --match owner/name
 # reads the token from stdin; --scope write exists but nothing uses it yet
 ```
+
+**[docs/github-token.md](docs/github-token.md)** is the step-by-step: which
+kind of GitHub token, which permission, and how to verify it.
 
 It is a root CLI command reading stdin, not an MCP tool, on purpose: a tool
 argument would be recorded in the conversation that called it. The token stays
