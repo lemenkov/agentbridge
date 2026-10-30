@@ -40,9 +40,18 @@ to a single repository, which is the whole point here.
    pick an organisation that requires approval, the token stays *pending* and
    can read only public repositories until an org admin approves it, which
    looks exactly like a broken token if you do not know to expect it.
-5. **Repository access** — **Only select repositories**, and select the one
-   repository. Not *All repositories*: this token is going onto a host that
-   runs unattended agents, and the blast radius should be one repository.
+5. **Repository access** — two defensible answers, and the choice decides
+   what you type in step 2 as well:
+   - **Only select repositories** → one repository (or a few). Narrowest
+     blast radius, and the right default for a token going onto a host that
+     runs unattended agents.
+   - **All repositories** → every repository the resource owner has, now and
+     in future. One token to manage instead of one per repository, at the
+     cost of a wider blast radius — and note "in future": a repository you
+     create next month is covered without you deciding anything.
+
+   Pick deliberately; both are supported end to end, and the `--match`
+   argument in step 2 has to agree with what you picked.
 6. **Permissions** → **Repository permissions** → **Contents: Read-only**.
    That is the only one needed for clone and fetch. GitHub adds
    **Metadata: Read-only** automatically and will not let you remove it; that
@@ -63,9 +72,20 @@ As root, on the host running the service:
 
 ```bash
 cd /opt/mcp-servers/agentbridge
+
+# a token scoped to one repository
 sudo venv/bin/agentbridge-admin git-token claude \
     --host github.com --match lemenkov/myrepo
+
+# a token scoped to every repository you own
+sudo venv/bin/agentbridge-admin git-token claude \
+    --host github.com --match 'lemenkov/*'
 ```
+
+**Quote the `owner/*` form.** Unquoted, the shell can expand the `*` before
+the command ever sees it, and the credential is then registered against
+something you did not type. This is the same class of mistake as an unquoted
+`safe.directory=*`, which bit this project once already.
 
 Note there is no `add` in that command — the subcommands are `git-token`,
 `git-token-list` and `git-token-remove`.
@@ -84,7 +104,7 @@ Arguments worth getting right:
 |---|---|
 | `claude` | the **tenant** the credential belongs to, not your GitHub login |
 | `--host` | `github.com` (also allowed: `gitlab.com`, `codeberg.org`) |
-| `--match` | `owner/name`. `owner/*` works but offers the token for every repository of that owner — it warns you, because that is broader than it needs to be |
+| `--match` | `owner/name` for one repository, or `'owner/*'` (quoted) for every repository of that owner. The wildcard prints a note — it is a confirmation that you meant it, not a warning that something is wrong. See *Matching several repositories* |
 | `--scope` | `read` by default, which is what `clone_repo` and `fetch_repo` use. `write` is accepted but no tool reaches it yet |
 
 The token's prefix is checked at registration (`github_pat_`, `ghp_`, `ghs_`,
@@ -95,6 +115,35 @@ permissions — only GitHub knows those.
 It can also be piped, for a script: `printf %s "$TOKEN" | sudo ...`. Prefer
 the interactive paste. A pipe means the token was in a variable or a file
 first, and now you have a second copy to remember to destroy.
+
+## Matching several repositories
+
+`--match 'lemenkov/*'` offers the credential for every repository under that
+owner. It is one entry to register, rotate and revoke instead of one per
+repository, which is the honest argument for it: a per-repository token you
+never get round to renewing is worse than a wildcard you actually maintain.
+
+What it does **not** do:
+
+- **It does not widen the token.** Our match decides which repositories this
+  service will *offer* the credential for; GitHub decides what the credential
+  can actually reach. If the token was created with *Only select
+  repositories*, a wildcard match still fails on everything else — with a
+  404, because GitHub does not confirm that a repository it cannot show you
+  exists. The two have to agree, and GitHub is the one enforcing it.
+- **It does not cover other owners.** `lemenkov/*` means repositories owned
+  by `lemenkov`. An organisation's repository needs its own entry, with that
+  organisation as the match and — at GitHub — as the token's resource owner.
+  Each resource owner is a separate token.
+- **It is not a pattern language.** The only wildcard is a whole `*` in place
+  of the repository name. `lemen*/foo` and `lemenkov/pro*` are rejected at
+  registration.
+
+**Both can coexist, and the narrower one wins.** Register
+`lemenkov/*` and `lemenkov/myrepo` and the exact match is selected for that
+repository, the wildcard for everything else. That is how to give one
+repository a different scope — a `write` credential, say — without widening
+the rest.
 
 ## 3. Verify it
 
@@ -151,7 +200,8 @@ and nothing in the design has to change when the App replaces it.
 | Symptom | Likely cause |
 |---|---|
 | `unrecognised token prefix` | a password, a truncated paste, or a classic token typed where a fine-grained one was meant |
-| `no credential for github.com/owner/name` | `--match` does not match the repository being cloned — check `git-token-list` |
+| `no credential for github.com/owner/name` | `--match` does not match the repository being cloned — check `git-token-list`. With a wildcard, check the *owner* matches: `lemenkov/*` does not cover an organisation's repository |
+| registered against a shell-expanded name | the `owner/*` match was unquoted; `git-token-list` shows what was actually stored |
 | 401 on a repository that used to work | the token expired, or was revoked at GitHub |
 | 404 on a private repository | the token is valid but cannot see it: wrong resource owner, repository not selected under *Only select repositories*, or an org approval still pending |
 | `Resource not accessible` | missing **Contents: Read-only** |
