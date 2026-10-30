@@ -204,8 +204,43 @@ and nothing in the design has to change when the App replaces it.
 | registered against a shell-expanded name | the `owner/*` match was unquoted; `git-token-list` shows what was actually stored |
 | 401 on a repository that used to work | the token expired, or was revoked at GitHub |
 | 404 on a private repository | the token is valid but cannot see it: wrong resource owner, repository not selected under *Only select repositories*, or an org approval still pending |
-| `Resource not accessible` | missing **Contents: Read-only** |
-| works for public, fails for private | the token is pending org approval, which permits public reads only |
+| `remote: Write access to repository not granted` + **403** on a *private* repository | **missing Contents: Read-only**, or that repository is not in the token's selection. GitHub's message is misleading: it says *write* when the missing permission is read, and says it for `ls-remote`, `clone` and `fetch` alike. See *The half-working token* |
+| `Resource not accessible` | missing **Contents: Read-only** (the REST API's wording for the same cause) |
+| works for public, fails for private | **Contents: Read-only** was never granted, or the token is pending org approval — both permit public reads only. See *The half-working token* |
 
 A 404 rather than a 403 is normal for a private repository a token cannot
 see — GitHub does not confirm that it exists.
+
+### The half-working token
+
+**Every fine-grained token can read public repositories with no permissions
+granted at all.** So a token created without **Contents: Read-only** is not
+obviously broken — it is *selectively* broken, in the most confusing way
+available:
+
+| | Public repository | Private repository |
+|---|---|---|
+| `test_git_credential` | succeeds | **403, "Write access … not granted"** |
+| `clone_repo` | succeeds, `authenticated: true` | 403 |
+
+The public success is not meaningless: GitHub answers 401 for a public
+repository if the token is invalid or expired, so it does prove the token is
+live and that the `GIT_CONFIG_*` Authorization path reaches the forge. It says
+nothing whatsoever about private access.
+
+**So test against a private repository, or you have tested almost nothing.**
+Observed for real on 2026-10-30: a token passed every public check, including
+an authenticated clone, and failed on the first private repository it was
+pointed at.
+
+The fix is at GitHub, not here. Open the token at
+<https://github.com/settings/personal-access-tokens> and check two things:
+
+1. **Permissions → Repository permissions → Contents** is `Read-only`. If the
+   Permissions step was skipped at creation, this is the cause.
+2. **Repository access** covers the repository — either *All repositories*, or
+   that repository listed under *Only select repositories*.
+
+Editing an existing fine-grained token's permissions does **not** invalidate
+it, so nothing needs re-registering on this side afterwards: the same token
+simply starts working.
