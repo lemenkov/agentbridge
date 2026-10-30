@@ -199,6 +199,11 @@ def add_token(tenant: Tenant, host: str, match: str, token: str,
     host = validate_host(host)
     match = validate_match(match)
     scope = validate_scope(scope)
+    # Strip before validating, not only before storing: a paste that picked up
+    # a leading space would otherwise fail the prefix check and report an
+    # unrecognised token, which sends you looking at the token instead of at
+    # the whitespace.
+    token = token.strip()
     description = describe_token(token)
 
     with _locked(tenant):
@@ -207,7 +212,7 @@ def add_token(tenant: Tenant, host: str, match: str, token: str,
         path = _token_path(tenant, cred_id)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, token.strip().encode())
+            os.write(fd, token.encode())
         finally:
             os.close(fd)
         if owner:

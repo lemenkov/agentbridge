@@ -336,3 +336,23 @@ class FetchLeaf(GitCredBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TokenWhitespace(GitCredBase):
+    """A pasted token often carries whitespace; it must not look like a typo."""
+
+    def test_surrounding_whitespace_is_accepted_and_not_stored(self):
+        entry = gitcred.add_token(
+            self.alice, "github.com", "o/n", f"  {TOKEN}\n")
+        self.assertEqual(entry["token_kind"], "github fine-grained")
+        env = gitcred.git_env(
+            self.alice, gitcred.select(self.alice, "github.com", "o/n"))
+        blob = base64.b64decode(
+            env["GIT_CONFIG_VALUE_0"].split("Basic ")[1]).decode()
+        self.assertEqual(blob, f"x-access-token:{TOKEN}")
+
+    def test_a_leading_space_does_not_become_an_unrecognised_prefix(self):
+        try:
+            gitcred.add_token(self.alice, "github.com", "o/n", f" {TOKEN}")
+        except gitcred.GitCredError as exc:
+            self.fail(f"a leading space was rejected as a bad token: {exc}")
