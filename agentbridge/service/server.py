@@ -20,7 +20,7 @@ from fastmcp.dependencies import CurrentHeaders
 
 from .. import expect as expect_mod
 from .. import ledger
-from ..bridge import validate_task_options
+from ..bridge import validate_task_options, validate_task_options_shape
 from ..bus import fold_messages
 from . import (
     backends,
@@ -656,7 +656,8 @@ async def spawn_worker(
     for _ in range(count):
         n = workers.next_index(ids, role)
         await workers.start(
-            workers.build_command(tenant, role, n, credential, pool, options))
+            workers.build_command(tenant, role, n, credential, pool, options,
+                                  chosen))
         agent_id = f"{role}-{n}"
         ids.append(agent_id)
         started.append({
@@ -702,9 +703,13 @@ async def send_task(
     needs in `body`. Returns a task_id; its output and a final `done` entry
     (with the exit code) appear in collect().
 
-    `model`/`effort` override the worker's defaults for this task only (same
-    values as spawn_worker) — e.g. haiku for quick triage, opus at high effort
-    for a hard task.
+    `model`/`effort` override the worker's defaults for this task only — e.g.
+    haiku for quick triage, opus at high effort for a hard task. Which model
+    names are legal is the *worker's* backend's business, not this call's: a
+    task can be addressed to a pool whose workers sit on different backends,
+    so a name is checked for shape here and against the backend's model list
+    by the worker that runs it. A name that worker does not allow comes back
+    as a rejected task (rc=2) naming what it does allow, not as an error here.
 
     `expect` declares the files the task must leave in its own output
     directory (mounted at `/out` in the container, writable even for
@@ -715,7 +720,9 @@ async def send_task(
     produced; `collect` returns the files."""
     try:
         tenant = tenant_from_headers(headers)
-        options = validate_task_options(model, effort)
+        # Shape only: this task may be headed for a pool whose workers sit on
+        # different backends, so the allowlist lives in the worker.
+        options = validate_task_options_shape(model, effort)
         declared = expect_mod.validate(expect)
         # Checked before dispatch: the limit stops new work starting, it
         # cannot cap a task already running.
@@ -763,7 +770,7 @@ async def broadcast(
     """
     try:
         tenant = tenant_from_headers(headers)
-        options = validate_task_options(model, effort)
+        options = validate_task_options_shape(model, effort)
         await asyncio.to_thread(budget.check, tenant)
     except (TenantError, ValueError, budget.BudgetExceeded) as e:
         return _fail(e)

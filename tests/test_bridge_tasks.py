@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -291,6 +292,103 @@ class DeclaredOutputs(TaskRun):
         done = self.sent("researcher-1.output", "done")[0]
         self.assertTrue(done["ok"])
         self.assertNotIn("expect", done)
+
+
+def _running(pid: int) -> bool:
+    """True while `pid` exists and is not a reaped-pending zombie.
+
+    `os.kill(pid, 0)` cannot answer this: a grandchild whose parent was killed
+    is reparented and may sit as a zombie for a moment, and a zombie still
+    accepts signal 0. Read the state field instead — the one after the `) `
+    that closes the comm field, which is why the split is on that and not on
+    whitespace (a command name may contain spaces).
+    """
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0]
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+    return state != "Z"
+
+
+class Timeouts(TaskRun):
+    """`task_timeout` is the only thing standing between a wedged agent and a
+    worker that never pulls another task: the task is acked when the agent
+    exits, so an agent that never exits holds its worker forever."""
+
+    SLEEPER = "import sys, time; sys.stdin.read(); time.sleep(300)"
+
+    async def test_a_task_over_its_deadline_reports_124_and_timeout(self):
+        await self.run_one([sys.executable, "-c", self.SLEEPER],
+                           "claude-stream-json", task_timeout=0.3)
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 124)
+        self.assertEqual(done["rc"], bridge.TIMEOUT_RC)
+        self.assertTrue(done["timeout"])
+        # A deadline is not a success, whatever the agent managed to print.
+        self.assertFalse(done["ok"])
+        row = self.ledger_lines()[0]
+        self.assertEqual(row["rc"], 124)
+        self.assertTrue(row["timeout"])
+
+    async def test_the_worker_pulls_again_after_a_timeout(self):
+        """The point of the whole flag: the loop survives the wedged task."""
+        await self.run_one([sys.executable, "-c", self.SLEEPER],
+                           "claude-stream-json", task_timeout=0.3)
+        # The shutdown message after the task was reached and acted on, which
+        # only happens if the task loop came back.
+        self.assertTrue(self.sent("researcher-1.output", "done"))
+
+    async def test_a_task_inside_its_deadline_is_untouched(self):
+        await self.run_one(agent_replaying(FIXTURE), "claude-stream-json",
+                           task_timeout=30)
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 0)
+        self.assertTrue(done["ok"])
+        # Absent, not false: a collector reads its presence as the reason.
+        self.assertNotIn("timeout", done)
+        self.assertNotIn("timeout", self.ledger_lines()[0])
+
+    async def test_an_unset_or_zero_deadline_waits(self):
+        """Neither may be read as "expire immediately"."""
+        for value in (None, 0, 0.0):
+            with self.subTest(task_timeout=value):
+                self.exchange = FakeExchange()
+                self.ledger_path = Path(self._tmp.name) / f"l-{value}.jsonl"
+                await self.run_one(agent_replaying(FIXTURE),
+                                   "claude-stream-json", task_timeout=value)
+                done = self.sent("researcher-1.output", "done")[0]
+                self.assertEqual(done["rc"], 0)
+                self.assertNotIn("timeout", done)
+
+    async def test_the_whole_process_group_dies_not_just_the_leaf(self):
+        """What `start_new_session` + `killpg` buy, stated as a test.
+
+        The real leaf is `podman run`, which has helpers of its own and can
+        leave a container behind if only the client is signalled. Stand in for
+        it with a leaf that ignores SIGTERM and has a child: nothing short of
+        SIGKILL to the group gets both.
+        """
+        marker = Path(self._tmp.name) / "grandchild.pid"
+        leaf = (
+            "import signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "sys.stdin.read()\n"
+            f"kid = subprocess.Popen([{sys.executable!r}, '-c',"
+            " 'import time; time.sleep(300)'])\n"
+            f"open({str(marker)!r}, 'w').write(str(kid.pid))\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(300)\n"
+        )
+        with mock.patch.object(bridge, "KILL_GRACE", 0.5):
+            await self.run_one([sys.executable, "-c", leaf],
+                               "claude-stream-json", task_timeout=1.0)
+        self.assertEqual(self.sent("researcher-1.output", "done")[0]["rc"], 124)
+        pid = int(marker.read_text())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _running(pid):
+            await asyncio.sleep(0.05)
+        self.assertFalse(_running(pid),
+                         "the leaf's child outlived the task's deadline")
 
 
 class Failures(TaskRun):

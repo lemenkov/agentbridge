@@ -5,7 +5,12 @@ import os
 import tempfile
 import unittest
 
-from agentbridge.bridge import option_args, resolve_amqp_url, validate_task_options
+from agentbridge.bridge import (
+    option_args,
+    resolve_amqp_url,
+    validate_task_options,
+    validate_task_options_shape,
+)
 
 
 class ResolveAmqpUrl(unittest.TestCase):
@@ -128,3 +133,57 @@ class ModelAllowlist(unittest.TestCase):
             {"model": "qwen3-coder", "effort": "high"})
         with self.assertRaises(ValueError):
             validate_task_options("qwen3-coder", "extreme", self.ALLOW)
+
+
+class DispatchShapeValidation(unittest.TestCase):
+    """`send_task` cannot know which backend will run the task.
+
+    It may be addressed to a role pool whose workers sit on different
+    backends, so there is no single allowlist to check against at dispatch.
+    The dispatcher therefore checks shape and the worker checks policy — it
+    was spawned with `--model-allow` and re-validates every override.
+    """
+
+    def test_a_non_claude_name_is_not_refused_at_dispatch(self):
+        # The defect this replaced: MODEL_RE rejected these before they ever
+        # reached the worker whose backend allows them.
+        for name in ("qwen3-coder:30b", "gpt-oss:20b", "llama3.2:3b",
+                     "deepseek-r1:7b", "Qwen2.5-Coder-32B-Instruct"):
+            with self.subTest(model=name):
+                self.assertEqual(validate_task_options_shape(name, None),
+                                 {"model": name})
+
+    def test_a_claude_name_still_passes(self):
+        self.assertEqual(
+            validate_task_options_shape("claude-opus-5-5", "high"),
+            {"model": "claude-opus-5-5", "effort": "high"})
+
+    def test_nothing_that_could_reach_an_argv_passes(self):
+        for bad in ("--dangerously-skip-permissions", "-v", "a b", "a\tb",
+                    "a;b", "a|b", "a$b", "a`b`", "a'b", 'a"b', "a&b",
+                    "../../etc/passwd", "a\nb", "", "a" * 200, " opus",
+                    "opus ", "a\x00b"):
+            with self.subTest(model=bad):
+                with self.assertRaises(ValueError):
+                    validate_task_options_shape(bad, None)
+
+    def test_a_non_string_is_refused(self):
+        for bad in (5, ["opus"], {"model": "opus"}, True):
+            with self.subTest(model=bad):
+                with self.assertRaises(ValueError):
+                    validate_task_options_shape(bad, None)
+
+    def test_effort_is_still_a_closed_set(self):
+        # Effort is a claude flag with fixed levels; no backend widens it.
+        self.assertEqual(validate_task_options_shape(None, "max"),
+                         {"effort": "max"})
+        with self.assertRaises(ValueError):
+            validate_task_options_shape(None, "extreme")
+
+    def test_neither_set_is_an_empty_dict_not_an_error(self):
+        self.assertEqual(validate_task_options_shape(None, None), {})
+
+    def test_the_error_says_where_the_real_decision_is_made(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_task_options_shape("--flag", None)
+        self.assertIn("backend", str(caught.exception))

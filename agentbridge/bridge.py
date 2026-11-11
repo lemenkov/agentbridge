@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 import uuid
@@ -47,6 +48,16 @@ PROGRESS_INTERVAL = 5.0
 # leaf is a child of the worker's own unit and so already inside its caps —
 # a nested unit would escape that cgroup's accounting.
 CHECKPOINT_TIMEOUT = 60.0
+
+# How long a leaf gets to leave after SIGTERM before SIGKILL. `podman run`
+# proxies the signal into the container and then has to tear the container
+# down, so this is not instant.
+KILL_GRACE = 10.0
+
+# What a task that ran out of time reports. 124 is GNU timeout(1)'s code; the
+# leaf's own signal-derived code (-15) would read as a crash instead of a
+# deadline, and 0 would read as success.
+TIMEOUT_RC = 124
 
 
 def resolve_amqp_url(
@@ -118,6 +129,50 @@ def validate_task_options(
     return options
 
 
+# What a model name may look like at a dispatcher that does not yet know which
+# backend will run the task. Deliberately permissive about content and strict
+# about shape: one argv token, no whitespace, no shell metacharacters, and a
+# leading alphanumeric so the value can never be read as a flag.
+LOOSE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
+
+
+def validate_task_options_shape(
+    model: str | None, effort: str | None
+) -> dict[str, str]:
+    """Validate a per-task model/effort override by *shape* only.
+
+    For the dispatch path, which cannot know the allowlist. A task may be
+    addressed to a role pool, and a pool's workers can sit on different
+    backends with different model names, so there is no single set to check
+    against here; checking against Claude's pattern instead would refuse a
+    legitimate ``qwen3-coder:30b`` before it ever reached the worker that
+    allows it.
+
+    The authority is the worker, which does know: it was spawned with
+    ``--model-allow`` from its backend's `models`, re-validates every
+    per-task override against it, and rejects with rc=2 and a `task rejected`
+    line on the bus. So this checks only that the value is a plausible single
+    argv token — enough that nothing can be smuggled into the leaf's argv —
+    and leaves the policy where the knowledge is.
+    """
+    options = {}
+    if model is not None:
+        if not isinstance(model, str) or not LOOSE_MODEL_RE.match(model):
+            raise ValueError(
+                f"invalid model {model!r}: a model name is one token of "
+                f"letters, digits and ._:/+- , starting with a letter or "
+                f"digit (the worker's backend decides which names it accepts)"
+            )
+        options["model"] = model
+    if effort is not None:
+        if effort not in EFFORT_LEVELS:
+            raise ValueError(
+                f"invalid effort {effort!r}: use one of {', '.join(EFFORT_LEVELS)}"
+            )
+        options["effort"] = effort
+    return options
+
+
 def option_args(options: dict[str, str]) -> list[str]:
     args = []
     for key in ("model", "effort"):
@@ -149,6 +204,7 @@ async def bridge(
     ledger_file: str | None = None,
     role: str | None = None,
     backend: str = "anthropic",
+    task_timeout: float | None = None,
     status_file: str | None = None,
     out_template: str | None = None,
     checkpoint_command: list[str] | None = None,
@@ -215,6 +271,8 @@ async def bridge(
                 ledger_file or "off", status_file or "off",
                 out_template or "off",
                 "on" if checkpoint_command else "off")
+    logger.info("Task timeout: %s",
+                f"{task_timeout:.0f}s" if task_timeout else "none")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -297,6 +355,11 @@ async def bridge(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=STREAM_LIMIT,
+            # The leaf leads its own process group, which is what makes the
+            # timeout path below able to signal the whole group — `podman run`
+            # plus its helpers — without the signal reaching this worker.
+            # Unit shutdown is unaffected: systemd kills the whole cgroup.
+            start_new_session=True,
         )
         proc.stdin.write(payload.encode())
         await proc.stdin.drain()
@@ -373,8 +436,50 @@ async def bridge(
                     sys.stderr.write(line.decode(errors="replace"))
                     sys.stderr.flush()
 
-        await asyncio.gather(pump_stdout(), pump_stderr())
-        rc = await proc.wait()
+        async def drain() -> int:
+            await asyncio.gather(pump_stdout(), pump_stderr())
+            return await proc.wait()
+
+        async def stop_leaf() -> None:
+            """SIGTERM the leaf's process group, SIGKILL whatever survives.
+
+            The group, not the process: the wrapped command is `podman run`,
+            which has helpers of its own, and killing only the client can
+            leave the container running with nobody reading its output.
+            """
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    # The group is already gone, or is not ours to signal.
+                    # Signal the process itself rather than wait on something
+                    # nothing was ever sent to — waiting on a live leaf we
+                    # failed to signal is how this worker would hang forever.
+                    try:
+                        proc.send_signal(sig)
+                    except ProcessLookupError:
+                        break
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=KILL_GRACE)
+                    return
+                except TimeoutError:
+                    continue
+            await proc.wait()
+
+        timed_out = False
+        runner = asyncio.ensure_future(drain())
+        try:
+            # `or None` so an unset or zero timeout waits forever, which is
+            # what every backend without a task_timeout wants.
+            rc = await asyncio.wait_for(runner, timeout=task_timeout or None)
+        except TimeoutError:
+            timed_out = True
+            await stop_leaf()
+            rc = TIMEOUT_RC
+            logger.warning(
+                "Task %s exceeded its %.0fs timeout — leaf killed",
+                task_id, task_timeout,
+            )
         metrics, driver_error = driver.finish()
         if counts["overruns"]:
             driver_error = (
@@ -384,6 +489,7 @@ async def bridge(
             )
         return {
             "rc": rc,
+            "timeout": timed_out,
             "stdout": counts["stdout"],
             "stderr": counts["stderr"],
             "progress": counts["progress"],
@@ -423,6 +529,8 @@ async def bridge(
             record["models"] = metrics["models"]
         if result.get("driver_error"):
             record["driver_error"] = result["driver_error"]
+        if result.get("timeout"):
+            record["timeout"] = True
         if "expect_ok" in result:
             record["expect_ok"] = result["expect_ok"]
             record["ok"] = result["rc"] == 0 and result["expect_ok"]
@@ -582,6 +690,10 @@ async def bridge(
                     done["metrics"] = result["metrics"]
                     if result["driver_error"]:
                         done["driver_error"] = result["driver_error"]
+                    if result.get("timeout"):
+                        # Absent means "finished on its own"; a caller that
+                        # sees rc=124 needs to know whether the leaf chose it.
+                        done["timeout"] = True
                     if "expect" in result:
                         done["expect"] = result["expect"]
                     if "checkpoint" in result:
@@ -691,6 +803,15 @@ def main() -> None:
         help="Default effort for every task, appended as `--effort LEVEL`.",
     )
     parser.add_argument(
+        "--task-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Kill a task's agent after this many seconds and report rc=124 "
+             "with timeout=true (default: no limit). The service passes the "
+             "backend's `task_timeout`.",
+    )
+    parser.add_argument(
         "--allow-task-overrides",
         action="store_true",
         help='Let a task message set "model"/"effort" for that task, overriding '
@@ -769,6 +890,9 @@ def main() -> None:
     if not args.command:
         parser.error("No command specified — provide a command to wrap after the options")
 
+    if args.task_timeout is not None and args.task_timeout <= 0:
+        parser.error("--task-timeout must be a positive number of seconds")
+
     try:
         amqp_url = resolve_amqp_url(args.amqp_url, args.amqp_url_file, os.environ)
         default_options = validate_task_options(
@@ -828,6 +952,7 @@ def main() -> None:
         ledger_file=args.ledger_file,
         role=args.role,
         backend=args.backend,
+        task_timeout=args.task_timeout,
         status_file=args.status_file,
         out_template=args.out_template,
         checkpoint_command=checkpoint_command,

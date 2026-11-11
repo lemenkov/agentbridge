@@ -11,7 +11,7 @@ import json
 import re
 
 from ..bridge import option_args
-from . import checkpoint, checks, config, workspace
+from . import backends, checkpoint, checks, config, workspace
 from .roles import ROLES, Role
 from .tenant import Tenant
 
@@ -35,11 +35,21 @@ def build_command(
     credential: tuple[str, str],
     pool: bool,
     options: dict[str, str] | None = None,
+    backend: backends.Backend | None = None,
 ) -> list[str]:
     """The full ``systemd-run`` argv for one worker. No secret appears in it:
     the bus URL is read from a 0600 file and the Anthropic credential is
-    injected by podman from its secret store."""
+    injected by podman from its secret store.
+
+    `backend` is the resolved backend this worker runs against. It decides
+    three things the worker cannot work out for itself: which model names a
+    task may ask for (`--model-allow`), how long a task may run
+    (`--task-timeout`), and what to record in the ledger (`--backend`).
+    Omitted, the worker gets the hosted Anthropic defaults — Claude's own
+    naming pattern and no deadline.
+    """
     role: Role = ROLES[role_name]
+    backend = backend or backends.ANTHROPIC
     agent_id = f"{role_name}-{n}"
     unit = unit_name(tenant, agent_id)
     secret, env_var = credential
@@ -71,7 +81,15 @@ def build_command(
         # Defaults for this worker; tasks may override them (allowlisted).
         *option_args(options),
         "--allow-task-overrides",
+        # Where this worker's requests go, for the ledger and the status file.
+        "--backend", backend.name,
     ]
+    # The closed set of model names a task may pick from. Absent for
+    # `anthropic`, whose names the bridge validates against its own pattern.
+    for model in backend.models:
+        cmd += ["--model-allow", model]
+    if backend.task_timeout:
+        cmd += ["--task-timeout", str(backend.task_timeout)]
     if role.workspace == "rw":
         # Only read-write roles can change anything worth undoing, and the
         # leaf costs about a second per task.

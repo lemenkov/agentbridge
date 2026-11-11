@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agentbridge.service import config, workers, workspace
+from agentbridge.service import backends, config, workers, workspace
 from agentbridge.service.roles import ROLES
 from agentbridge.service.tenant import (
     TenantError,
@@ -141,11 +141,71 @@ class WorkerCommand(TenantDirs):
         cmd = workers.build_command(self.alice, "researcher", 1, cred, False,
                                     {"model": "opus", "effort": "high"})
         podman = cmd.index("podman")
-        # bridge flags (before the wrapped command), not claude argv
-        self.assertEqual(cmd[podman - 9:podman - 5], ["--model", "opus", "--effort", "high"])
-        self.assertIn("--allow-task-overrides", cmd[:podman])
+        # bridge flags (before the wrapped command), not claude argv. Located
+        # by content, not by offset from `podman`: flags are added after these
+        # and a fixed offset turns that into a failure here.
+        bridge_flags = cmd[:podman]
+        want = ["--model", "opus", "--effort", "high"]
+        start = bridge_flags.index("--model")
+        self.assertEqual(bridge_flags[start:start + len(want)], want)
+        self.assertIn("--allow-task-overrides", bridge_flags)
         self.assertNotIn("--model", cmd[podman:])
         self.assertTrue(any("(model=opus effort=high)" in a for a in cmd))
+
+    def build_on(self, backend, role="researcher"):
+        cred = ("anthropic-alice-apikey", "ANTHROPIC_API_KEY")
+        with mock.patch.object(config, "CLAUDE_BIN", "/usr/bin/claude"):
+            return workers.build_command(self.alice, role, 3, cred, False,
+                                         None, backend)
+
+    OLLAMA = backends.Backend(
+        name="sulaco",
+        kind="ollama",
+        endpoints=(backends.Endpoint(url="http://10.0.0.5:11434"),),
+        models=("qwen3-coder:30b", "gpt-oss:20b"),
+        default_model="qwen3-coder:30b",
+        task_timeout=900,
+    )
+
+    def test_the_backend_decides_the_model_allowlist(self):
+        """The worker cannot work this out for itself, and nothing else in the
+        argv tells it that `qwen3-coder:30b` is a legal model name."""
+        cmd = self.build_on(self.OLLAMA)
+        bridge_flags = cmd[:cmd.index("podman")]
+        for model in self.OLLAMA.models:
+            i = bridge_flags.index(model)
+            self.assertEqual(bridge_flags[i - 1], "--model-allow")
+        self.assertEqual(bridge_flags.count("--model-allow"), 2)
+
+    def test_the_backend_decides_the_task_deadline(self):
+        cmd = self.build_on(self.OLLAMA)
+        bridge_flags = cmd[:cmd.index("podman")]
+        i = bridge_flags.index("--task-timeout")
+        self.assertEqual(bridge_flags[i + 1], "900")
+
+    def test_the_backend_name_reaches_the_ledger(self):
+        cmd = self.build_on(self.OLLAMA)
+        i = cmd.index("--backend")
+        self.assertEqual(cmd[i + 1], "sulaco")
+        self.assertLess(i, cmd.index("podman"))
+
+    def test_anthropic_gets_neither_an_allowlist_nor_a_deadline(self):
+        """Its model names are Claude's own pattern, which the bridge knows,
+        and the hosted API has no operator-set deadline."""
+        for backend in (None, backends.ANTHROPIC):
+            with self.subTest(backend=backend):
+                cmd = self.build_on(backend)
+                self.assertNotIn("--model-allow", cmd)
+                self.assertNotIn("--task-timeout", cmd)
+                self.assertEqual(cmd[cmd.index("--backend") + 1], "anthropic")
+
+    def test_no_backend_field_reaches_the_agent_argv(self):
+        cmd = self.build_on(self.OLLAMA)
+        agent_argv = cmd[cmd.index("podman"):]
+        for flag in ("--model-allow", "--task-timeout", "--backend"):
+            self.assertNotIn(flag, agent_argv)
+        # And no endpoint: where the requests go is not the leaf's business.
+        self.assertNotIn("10.0.0.5", " ".join(agent_argv))
 
     def test_ledger_and_driver_reach_the_bridge_not_the_agent(self):
         cmd = self.build()
