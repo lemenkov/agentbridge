@@ -32,7 +32,7 @@ class FakeRunner:
 class WithReplace(unittest.TestCase):
     def setUp(self):
         patch = mock.patch.object(secrets_mod, "_supports_replace",
-                                  lambda: True)
+                                  lambda runner=None: True)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -67,7 +67,7 @@ class WithReplace(unittest.TestCase):
 class WithoutReplace(unittest.TestCase):
     def setUp(self):
         patch = mock.patch.object(secrets_mod, "_supports_replace",
-                                  lambda: False)
+                                  lambda runner=None: False)
         patch.start()
         self.addCleanup(patch.stop)
 

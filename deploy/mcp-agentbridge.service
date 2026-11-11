@@ -28,13 +28,44 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mcp-agentbridge
 
+# Sandboxing: see invariant I-6. Read this before adding a directive.
+#
+# Rootless podman keeps ONE pause process per user, and every container
+# started afterwards joins its mount namespace. So any directive here that
+# changes this service's mount table is inherited by every future container
+# -- and the failure surfaces later, in a different subsystem, with an error
+# naming neither this file nor the directive responsible.
+#
+# Twice now:
+#   ProtectKernelTunables=yes  covered /proc/sys and nine other /proc paths;
+#     the kernel then refused each container's own /proc mount and every task
+#     failed rc=126 (2026-11-03).
+#   PrivateTmp=yes             gave the service a private /tmp, which systemd
+#     DELETES on restart; containers then got `mkdir /tmp/runctop...: no such
+#     file or directory` from runc (2026-11-07). Latent for a day -- it only
+#     bit when the service was restarted.
+#
+# It is not about /proc, and not about /tmp. It is about the mount table.
+#
+# Since 2026-11-07 the service makes no podman call from its own namespace
+# (everything goes through systemd-run --user; see service/sdrun.py), so the
+# pause process is born from the user manager and these directives are belt
+# and braces rather than the only defence. Keep it that way.
+#
+# Do NOT add, and do not re-add: ProtectKernelTunables, ProtectProc,
+# ProcSubset, ProtectKernelLogs, ReadOnlyPaths covering /proc or /tmp, or
+# ProtectHome (which also hides /run/user, where the user manager's and
+# podman's sockets live). PrivateTmp is kept below only because podman no
+# longer runs here; if that ever changes, it goes first.
+#
+# Verify on the host by reading the pause process's mount table, never this
+# file -- this file is what looked innocent both times:
+#   pgrep -u agentbridge -f 'catatonit -P'
+#   grep -E ' /tmp | /proc ' /proc/<pid>/mountinfo   # no 'deleted', no 'ro,'
 PrivateTmp=yes
 ProtectSystem=full
-# Not ProtectHome=: it also hides /run/user, where the service user's podman
-# and systemd user-manager sockets live.
 InaccessiblePaths=/home /root
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
 RestrictRealtime=yes
 LockPersonality=yes
 

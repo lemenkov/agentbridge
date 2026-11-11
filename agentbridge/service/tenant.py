@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-from . import config
+from . import config, sdrun
 
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
@@ -143,13 +143,18 @@ def tenant_from_headers(headers: dict) -> Tenant:
 
 
 async def podman_secret_names() -> set[str]:
-    """Names of the podman secrets in the service user's store (names only)."""
-    proc = await asyncio.create_subprocess_exec(
-        "podman", "secret", "ls", "--format", "{{.Name}}",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    """Names of the podman secrets in the service user's store (names only).
+
+    Through ``sdrun`` because this is podman: issued directly it would birth
+    the rootless pause process inside this service's mount namespace and
+    poison every container started afterwards (I-6, review log 49). It is also
+    the specific call that did so.
+    """
+    rc, out, err = await sdrun.run(
+        ["podman", "secret", "ls", "--format", "{{.Name}}"],
+        description="agentbridge podman secret ls", timeout=30,
     )
-    out, err = await proc.communicate()
-    if proc.returncode != 0:
+    if rc != 0:
         raise RuntimeError(f"podman secret ls failed: {err.decode().strip()}")
     return set(out.decode().split())
 

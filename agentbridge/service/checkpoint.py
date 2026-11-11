@@ -27,7 +27,7 @@ import json
 import logging
 import re
 
-from . import config
+from . import config, sdrun
 from .roles import ROLES
 from .tenant import Tenant
 
@@ -142,18 +142,24 @@ def fetch_command(tenant: Tenant, role_name: str, rel: str,
 
 
 async def run_leaf(argv: list[str]) -> dict:
-    """Run a git leaf and parse its JSON. Errors are reported, not raised."""
+    """Run a git leaf and parse its JSON. Errors are reported, not raised.
+
+    Through ``sdrun`` so the container does not start from this service's
+    mount namespace (I-6). The checkpoint leaf needs no such wrapping — its
+    argv is handed to the bridge, which already runs inside the worker's own
+    transient unit — but the rollback and fetch leaves are spawned from here,
+    by the service, and so are exactly the case the invariant is about.
+    """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        rc, out, err = await sdrun.run(
+            argv, description="agentbridge git leaf", timeout=LEAF_TIMEOUT,
+            max_seconds=int(LEAF_TIMEOUT) + 30,
         )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=LEAF_TIMEOUT)
-    except (TimeoutError, OSError) as exc:
+    except (TimeoutError, asyncio.TimeoutError, OSError) as exc:
         raise CheckpointError(f"the git leaf did not finish: {exc}") from None
-    if proc.returncode != 0:
+    if rc != 0:
         detail = err.decode(errors="replace").strip()[-300:]
-        raise CheckpointError(f"the git leaf failed (rc={proc.returncode}): {detail}")
+        raise CheckpointError(f"the git leaf failed (rc={rc}): {detail}")
     try:
         payload = json.loads(out.decode(errors="replace") or "{}")
     except json.JSONDecodeError:
