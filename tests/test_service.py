@@ -189,6 +189,25 @@ class WorkerCommand(TenantDirs):
         self.assertEqual(cmd[i + 1], "sulaco")
         self.assertLess(i, cmd.index("podman"))
 
+    def test_a_deadline_brings_a_named_leaf_and_the_argv_to_stop_it(self):
+        """A deadline is unenforceable without it: a signal to `podman run`'s
+        process group reaches the client, not the container."""
+        cmd = self.build_on(self.OLLAMA)
+        name = "ab-alice-researcher-3-{task_id}"
+        podman = cmd.index("podman")
+        # The leaf is named...
+        self.assertEqual(cmd[cmd.index("--name") + 1], name)
+        self.assertGreater(cmd.index("--name"), podman)
+        # ...and the bridge is told how to stop that exact name.
+        stop = json.loads(cmd[cmd.index("--stop-command") + 1])
+        self.assertEqual(stop, ["podman", "stop", "--time", "5", name])
+        self.assertLess(cmd.index("--stop-command"), podman)
+
+    def test_no_deadline_means_no_stop_command(self):
+        """Nothing to stop: without --task-timeout the bridge never calls it."""
+        cmd = self.build_on(backends.ANTHROPIC)
+        self.assertNotIn("--stop-command", cmd)
+
     def test_anthropic_gets_neither_an_allowlist_nor_a_deadline(self):
         """Its model names are Claude's own pattern, which the bridge knows,
         and the hosted API has no operator-set deadline."""

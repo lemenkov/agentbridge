@@ -28,6 +28,16 @@ def unit_name(tenant: Tenant, agent_id: str) -> str:
     return f"{tenant.unit_prefix}{agent_id}.service"
 
 
+def _leaf_name(tenant: Tenant, agent_id: str) -> str:
+    """The per-task container name, with `{task_id}` left for the bridge.
+
+    Unique per task because the task id is, which `podman run --name` needs;
+    legible to an operator reading `podman ps` because the tenant and worker
+    are in it.
+    """
+    return f"ab-{tenant.name}-{agent_id}-{{task_id}}"
+
+
 def build_command(
     tenant: Tenant,
     role_name: str,
@@ -90,6 +100,16 @@ def build_command(
         cmd += ["--model-allow", model]
     if backend.task_timeout:
         cmd += ["--task-timeout", str(backend.task_timeout)]
+        # A deadline is only enforceable if the *container* can be ended, and
+        # a signal to `podman run`'s process group cannot do it: conmon is its
+        # own process group leader, so the group holds the client alone.
+        # Killing it would leave the agent running with nobody reading its
+        # output. So the leaf gets a name and the bridge gets the argv that
+        # stops it. Same namespace as the `podman run` below — this worker is
+        # itself a transient unit started by `systemd-run --user`, so I-6 is
+        # satisfied by the same route and not bypassed here.
+        cmd += ["--stop-command", json.dumps(
+            ["podman", "stop", "--time", "5", _leaf_name(tenant, agent_id)])]
     if role.workspace == "rw":
         # Only read-write roles can change anything worth undoing, and the
         # leaf costs about a second per task.
@@ -103,6 +123,9 @@ def build_command(
     # The wrapped command follows directly — no `--` separator.
     cmd += [
         "podman", "run", "--rm", "--interactive",
+        # Named so a task that hits its deadline can be stopped by name. The
+        # bridge substitutes {task_id} in both this argv and --stop-command.
+        "--name", _leaf_name(tenant, agent_id),
         "--cgroups=split",
         "--security-opt", "label=disable",
         "--security-opt", "no-new-privileges",

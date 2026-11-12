@@ -49,10 +49,12 @@ PROGRESS_INTERVAL = 5.0
 # a nested unit would escape that cgroup's accounting.
 CHECKPOINT_TIMEOUT = 60.0
 
-# How long a leaf gets to leave after SIGTERM before SIGKILL. `podman run`
-# proxies the signal into the container and then has to tear the container
-# down, so this is not instant.
+# How long a leaf gets to leave after being asked to stop, at each escalation.
 KILL_GRACE = 10.0
+
+# How long the stop command itself gets. `podman stop --time 5` takes about
+# 5.5 s on this host, so this is generous without being unbounded.
+STOP_TIMEOUT = 30.0
 
 # What a task that ran out of time reports. 124 is GNU timeout(1)'s code; the
 # leaf's own signal-derived code (-15) would read as a crash instead of a
@@ -205,6 +207,7 @@ async def bridge(
     role: str | None = None,
     backend: str = "anthropic",
     task_timeout: float | None = None,
+    stop_command: list[str] | None = None,
     status_file: str | None = None,
     out_template: str | None = None,
     checkpoint_command: list[str] | None = None,
@@ -271,8 +274,9 @@ async def bridge(
                 ledger_file or "off", status_file or "off",
                 out_template or "off",
                 "on" if checkpoint_command else "off")
-    logger.info("Task timeout: %s",
-                f"{task_timeout:.0f}s" if task_timeout else "none")
+    logger.info("Task timeout: %s | stop command: %s",
+                f"{task_timeout:.0f}s" if task_timeout else "none",
+                " ".join(stop_command) if stop_command else "signal only")
     logger.info("Agent command: %s", " ".join(command))
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
@@ -344,7 +348,9 @@ async def bridge(
         driver = make_driver(driver_name)
 
         argv = command
-        if out_dir is not None and task_id is not None:
+        if task_id is not None:
+            # Not conditional on out_dir: the leaf argv also carries the
+            # container name the stop command below has to match.
             argv = [arg.replace("{task_id}", task_id) for arg in command]
 
         proc = await asyncio.create_subprocess_exec(
@@ -440,13 +446,56 @@ async def bridge(
             await asyncio.gather(pump_stdout(), pump_stderr())
             return await proc.wait()
 
-        async def stop_leaf() -> None:
-            """SIGTERM the leaf's process group, SIGKILL whatever survives.
+        async def run_stop_command() -> bool:
+            """Ask the leaf's supervisor to end it. True if the leaf then left.
 
-            The group, not the process: the wrapped command is `podman run`,
-            which has helpers of its own, and killing only the client can
-            leave the container running with nobody reading its output.
+            This, not a signal, is the mechanism — measured on this host
+            2026-11-12. `podman run`'s process group contains exactly **one**
+            process, the client: conmon is its own process group leader by
+            design, which is how a container survives its client exiting. So
+            `killpg` kills the client and leaves the agent running with nobody
+            reading its output — the very thing the signal was meant to
+            prevent. `podman stop` removes the container in about 5.5 s and
+            the client then exits by itself with rc=137.
+
+            Kept generic deliberately: the bridge wraps an arbitrary command
+            and must not know what podman is (Part F). The service supplies
+            the argv, `{task_id}` substituted, exactly as for
+            `--checkpoint-command`.
             """
+            if not stop_command or task_id is None:
+                return False
+            argv = [arg.replace("{task_id}", task_id) for arg in stop_command]
+            try:
+                stopper = await asyncio.create_subprocess_exec(
+                    *argv, stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, err = await asyncio.wait_for(
+                    stopper.communicate(), timeout=STOP_TIMEOUT)
+            except (TimeoutError, OSError) as exc:
+                logger.warning("Stop command for task %s failed: %s",
+                               task_id, exc)
+                return False
+            if stopper.returncode != 0:
+                logger.warning(
+                    "Stop command for task %s exited %d: %s", task_id,
+                    stopper.returncode,
+                    err.decode(errors="replace").strip()[-300:])
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=KILL_GRACE)
+                return True
+            except TimeoutError:
+                return False
+
+        async def stop_leaf() -> None:
+            """End the leaf: its container first, then its process.
+
+            The signal path stays as the backstop — for a leaf that is not a
+            container at all, and for one whose supervisor did not answer.
+            """
+            if await run_stop_command():
+                return
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(proc.pid, sig)
@@ -812,6 +861,18 @@ def main() -> None:
              "backend's `task_timeout`.",
     )
     parser.add_argument(
+        "--stop-command",
+        default=None,
+        metavar="JSON",
+        help="Argv, as a JSON array, run to end a task that hit its "
+             "--task-timeout, with {task_id} substituted (e.g. "
+             '\'["podman","stop","--time","5","ab-{task_id}"]\'). Needed '
+             "because a signal to the wrapped command's process group does "
+             "not reach a container: podman's conmon is its own group leader. "
+             "Without it the timeout kills the client and leaves the agent "
+             "running. Signals remain the fallback.",
+    )
+    parser.add_argument(
         "--allow-task-overrides",
         action="store_true",
         help='Let a task message set "model"/"effort" for that task, overriding '
@@ -900,6 +961,21 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
+    stop_command = None
+    if args.stop_command:
+        try:
+            stop_command = json.loads(args.stop_command)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--stop-command is not valid JSON: {exc}")
+        if (not isinstance(stop_command, list)
+                or not all(isinstance(a, str) for a in stop_command)
+                or not stop_command):
+            parser.error("--stop-command must be a non-empty JSON array "
+                         "of strings")
+        if args.task_timeout is None:
+            parser.error("--stop-command is only used on a task timeout; "
+                         "pass --task-timeout too, or drop it")
+
     checkpoint_command = None
     if args.checkpoint_command:
         try:
@@ -953,6 +1029,7 @@ def main() -> None:
         role=args.role,
         backend=args.backend,
         task_timeout=args.task_timeout,
+        stop_command=stop_command,
         status_file=args.status_file,
         out_template=args.out_template,
         checkpoint_command=checkpoint_command,

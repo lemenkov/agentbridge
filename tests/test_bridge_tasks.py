@@ -360,6 +360,91 @@ class Timeouts(TaskRun):
                 self.assertEqual(done["rc"], 0)
                 self.assertNotIn("timeout", done)
 
+    def leaf_that_only_a_stop_command_can_end(self, marker, witness):
+        """A leaf that ignores SIGTERM and leaves only when `marker` appears.
+
+        It stands in for `podman run`, whose process group holds the client
+        alone — conmon is its own group leader — so a signal to the group
+        cannot end the container. Here, if the leaf exits cleanly it wrote
+        `witness`; if it was killed it could not have.
+        """
+        script = (
+            "import os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "sys.stdin.read()\n"
+            "for _ in range(1200):\n"
+            f"    if os.path.exists({str(marker)!r}):\n"
+            f"        open({str(witness)!r}, 'w').write('clean-exit')\n"
+            "        sys.exit(0)\n"
+            "    time.sleep(0.05)\n"
+        )
+        return [sys.executable, "-c", script]
+
+    async def test_the_stop_command_ends_the_leaf_and_the_signal_is_not_used(self):
+        """The defect this fixes: killpg reaches the client, not the container.
+
+        Measured on this host 2026-11-12 — `podman run`'s process group holds
+        exactly one process, and `podman stop` is what removes the container.
+        """
+        marker = Path(self._tmp.name) / "stop-asked"
+        witness = Path(self._tmp.name) / "left-cleanly"
+        await self.run_one(
+            self.leaf_that_only_a_stop_command_can_end(marker, witness),
+            "claude-stream-json", task_timeout=0.4,
+            stop_command=["touch", str(marker)],
+        )
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 124)
+        self.assertTrue(done["timeout"])
+        self.assertTrue(marker.exists(), "the stop command never ran")
+        # The load-bearing assertion: the leaf left under its own power, so
+        # the stop command — not SIGKILL — is what ended the task.
+        self.assertEqual(witness.read_text(), "clean-exit")
+
+    async def test_the_task_id_is_substituted_in_the_stop_command(self):
+        """It has to be, or the argv names the wrong container."""
+        out = Path(self._tmp.name) / "named"
+        with mock.patch.object(bridge, "KILL_GRACE", 0.5):
+            await self.run_one([sys.executable, "-c", self.SLEEPER],
+                               "claude-stream-json", task_timeout=0.3,
+                               stop_command=["sh", "-c",
+                                             f"printf %s ab-{{task_id}} > {out}"])
+        self.assertEqual(out.read_text(), "ab-T1")
+
+    async def test_a_stop_command_that_does_nothing_falls_back_to_signals(self):
+        """A supervisor that does not answer must not leave the worker stuck."""
+        # The grace itself is not what these assert.
+        with mock.patch.object(bridge, "KILL_GRACE", 0.5):
+            await self.run_one([sys.executable, "-c", self.SLEEPER],
+                               "claude-stream-json", task_timeout=0.3,
+                               stop_command=["true"])
+        done = self.sent("researcher-1.output", "done")[0]
+        self.assertEqual(done["rc"], 124)
+        self.assertTrue(done["timeout"])
+
+    async def test_a_failing_stop_command_still_ends_the_task(self):
+        # The grace itself is not what these assert.
+        with mock.patch.object(bridge, "KILL_GRACE", 0.5):
+            await self.run_one([sys.executable, "-c", self.SLEEPER],
+                               "claude-stream-json", task_timeout=0.3,
+                               stop_command=["false"])
+        self.assertEqual(self.sent("researcher-1.output", "done")[0]["rc"], 124)
+
+    async def test_a_missing_stop_binary_still_ends_the_task(self):
+        # The grace itself is not what these assert.
+        with mock.patch.object(bridge, "KILL_GRACE", 0.5):
+            await self.run_one([sys.executable, "-c", self.SLEEPER],
+                               "claude-stream-json", task_timeout=0.3,
+                               stop_command=["/nonexistent/stopper"])
+        self.assertEqual(self.sent("researcher-1.output", "done")[0]["rc"], 124)
+
+    async def test_the_stop_command_is_not_run_when_nothing_times_out(self):
+        marker = Path(self._tmp.name) / "must-not-exist"
+        await self.run_one(agent_replaying(FIXTURE), "claude-stream-json",
+                           task_timeout=30, stop_command=["touch", str(marker)])
+        self.assertEqual(self.sent("researcher-1.output", "done")[0]["rc"], 0)
+        self.assertFalse(marker.exists())
+
     async def test_the_whole_process_group_dies_not_just_the_leaf(self):
         """What `start_new_session` + `killpg` buy, stated as a test.
 
