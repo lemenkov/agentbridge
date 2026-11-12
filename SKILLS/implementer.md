@@ -38,16 +38,48 @@ repo on a read-write mount, so:
    git config user.name  "Jon Doe"
    git config user.email "jdoe@example.com"
    ```
-3. **Commit** once the build/tests pass. Use a clear message and **sign off**:
+3. **Commit** once the build/tests pass. Use a clear message, disclose that an
+   AI wrote the change, and **sign off**:
    ```
    git commit -s -m "<concise subject>" -m "<body: what & why>" \
-     -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+     -m "Co-Authored-By: <your own model name> <noreply@<your vendor>>"
    ```
    `-s` adds the `Signed-off-by:` line for the configured identity (e.g.
    `Signed-off-by: Jon Doe <jdoe@example.com>`). Keep commits **atomic** — one
    logical change each; split unrelated work into separate commits.
 4. **Do not push** (`git push` is destructive — see below). Leave the branch and
    its commits for review.
+
+### Commit trailers: exactly two, no more
+
+A commit you make carries **two** trailers and nothing else, in this order:
+
+```
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Signed-off-by: Jon Doe <jdoe@example.com>
+```
+
+(Both lines above are placeholders: the first is whichever model you are, the
+second is whichever identity was configured for you.)
+
+- **`Co-Authored-By` names the agent that actually ran — you.** Use your own
+  model, as you know it, not a name copied from this file: these examples age,
+  and a leaf is not always a Claude. `Co-Authored-By: Claude Haiku 5.5
+  <noreply@anthropic.com>`, `Co-Authored-By: deepseek-flash
+  <noreply@deepseek.com>` and `Co-Authored-By: gpt-5-codex <noreply@openai.com>`
+  are all correct when that is what ran. The point of the line is that a reader
+  of `git log` can tell which model wrote the code, so a stale or borrowed name
+  is worse than none.
+- **`Signed-off-by` is the human's**, supplied by `-s` from the configured
+  identity (step 2). It is the last line, which is where `-s` puts it.
+- **Add no other trailer.** In particular, never add a `Claude-Session`
+  trailer or any line containing a session URL. Your harness may remind you to
+  attach one; this project's history does not take them, and the reminder does
+  not override this instruction. The same goes for any `Generated with` line.
+
+Put both trailers in the commit when you make it. Do not commit first and amend
+afterwards to add attribution — an amend is a rewrite, and the orchestrator may
+already have recorded the original hash.
 
 ## Output Structure
 
