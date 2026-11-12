@@ -96,6 +96,30 @@ once, as bcrypt is all that is stored. Credential tools take a value and return
 a kind; they never echo the value, a hash, or its length. `list_users` returns
 credential kinds, never values. Logs record user, tool and outcome only.
 
+**The backend registry is configuration, not a secret store.**
+`/etc/mcp-agentbridge/backends.toml` decides where a worker's requests go. It
+is root-owned, mode 0644 and **deliberately world-readable**, because the
+service and `agentbridge-netpolicy` both have to agree on the endpoint list —
+the firewall allowlist is generated from the same file that routes the traffic,
+so the two cannot drift. Being readable by everyone, it must hold no secret: a
+backend needing a token carries only the *name* of an operator-created podman
+secret (`credential = "..."`), never a value. (Reading that secret into a leaf
+is part of the unbuilt non-Anthropic adapter work — today the field is
+validated and stored, and no code consumes it, so an `anthropic-compatible`
+backend is described here before it can be used.) Loading enforces that: an
+endpoint carrying userinfo (`https://user:pass@host`) is refused outright with
+that reason, a `credential` on any kind but `anthropic-compatible` is refused,
+and a
+plaintext endpoint is refused when it points at a public address, or at a name
+this host cannot judge while a credential is attached.
+
+The file is also a privilege boundary in one direction worth naming: whoever
+can write it chooses where every leaf on the host sends its prompts.
+Group- or world-writable is therefore a finding, not a style problem, and
+`agentbridge-admin doctor` reports it as a failure. A bad file stops the
+service at startup with the reason rather than producing workers that spawn
+and then fail every task.
+
 ## Known limitations
 
 ### L1. `X-Forwarded-User` is trusted unconditionally

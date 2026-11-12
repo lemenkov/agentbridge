@@ -282,7 +282,17 @@ host loopback services.
 pip install -e ".[systemd,mcp]"                 # into this repo's venv
 sudo deploy/setup-host.sh                       # service user, images, unit
 sudo venv/bin/agentbridge-admin provision <u> --git-name "..." --git-email "..."
+sudo venv/bin/agentbridge-admin doctor          # check the deploy, spawn nothing
 ```
+
+`doctor` is the cheap way to find a broken deploy: it reads `backends.toml`,
+the role preambles, the binaries and paths, asks podman whether each role's
+image exists, and probes any endpoint reachable without a credential — then
+exits non-zero if anything failed. It starts no container and sends no task,
+so it costs nothing to run and is safe on a busy host. A check it could not
+perform reports `skip`, never `ok`. It is the one subcommand that does not
+require root; without it the checks needing the service user's podman store
+are skipped and say so.
 
 Provisioning lives on a **separate endpoint** (`/mcp/agentbridge-admin`, its own
 port) so that an orchestrator reading untrusted agent output holds no handle to

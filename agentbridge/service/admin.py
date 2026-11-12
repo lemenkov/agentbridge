@@ -5,6 +5,7 @@
 
     agentbridge-admin provision petro --git-name "..." --git-email "..."
     agentbridge-admin list
+    agentbridge-admin doctor
     agentbridge-admin deprovision petro [--purge]
 
 A thin CLI over the same library functions the service uses, kept for
@@ -35,7 +36,17 @@ def _load_sysconfig() -> None:
     """Pick up the service's paths so admin and service always agree."""
     if not SYSCONFIG.exists():
         return
-    for line in SYSCONFIG.read_text().splitlines():
+    try:
+        text = SYSCONFIG.read_text()
+    except OSError as exc:
+        # The file is root-only by design. Every subcommand but `doctor` needs
+        # root anyway and will fail later with a clearer reason; `doctor` is
+        # specifically the one a non-root operator tries first, and a traceback
+        # about a file they were never meant to read tells them nothing.
+        print(f"note: cannot read {SYSCONFIG} ({exc.strerror}); using defaults "
+              f"for every path it would set", file=sys.stderr)
+        return
+    for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
@@ -304,6 +315,41 @@ def cmd_deprovision(args: argparse.Namespace) -> None:
               f"secrets (use --purge)")
 
 
+LEVEL_MARK = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL", "skip": "skip"}
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Report what is wrong with this deploy, without spawning a worker.
+
+    The runner is only built when we are root: as anyone else, `runuser` would
+    fail and the image check would report a problem that is ours, not the
+    deploy's. `doctor` then skips it and says so.
+    """
+    from . import doctor
+
+    runner = None
+    if os.geteuid() == 0:
+        svc = _service_user()
+        def runner(*argv):
+            return _as_service_user(svc, *argv)
+
+    findings = doctor.run_all(runner=runner)
+    width = max(len(f.check) for f in findings)
+    for finding in findings:
+        if args.quiet and finding.level == doctor.OK:
+            continue
+        print(f"[{LEVEL_MARK[finding.level]}] {finding.check:<{width}}  "
+              f"{finding.detail}")
+    counts = {level: sum(1 for f in findings if f.level == level)
+              for level in (doctor.OK, doctor.WARN, doctor.FAIL, doctor.SKIP)}
+    print(f"\n{counts['fail']} failed, {counts['warn']} warned, "
+          f"{counts['skip']} skipped, {counts['ok']} ok")
+    if runner is None:
+        print("(not running as root: checks needing the service user's podman "
+              "store were skipped)")
+    sys.exit(doctor.exit_code(findings))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="agentbridge-admin",
                                      description="Manage mcp-agentbridge tenants")
@@ -336,6 +382,13 @@ def main() -> None:
     p = sub.add_parser("list", help="list tenants, credentials and worker counts")
     p.set_defaults(func=cmd_list)
 
+    p = sub.add_parser("doctor",
+                       help="check config, paths, images and backends without "
+                            "spawning a worker")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="show only warnings, failures and skips")
+    p.set_defaults(func=cmd_doctor)
+
     p = sub.add_parser("git-token",
                        help="register a forge token for a tenant (from stdin)")
     p.add_argument("user")
@@ -366,7 +419,11 @@ def main() -> None:
     p.set_defaults(func=cmd_deprovision)
 
     args = parser.parse_args()
-    if os.geteuid() != 0:
+    # Every subcommand but `doctor` changes something only root may change.
+    # `doctor` changes nothing at all, and an operator diagnosing a host they
+    # do not own root on should still be able to ask what is wrong; the checks
+    # that genuinely need root report themselves as skipped.
+    if os.geteuid() != 0 and getattr(args, "func", None) is not cmd_doctor:
         sys.exit("agentbridge-admin must run as root")
     _load_sysconfig()
     args.func(args)

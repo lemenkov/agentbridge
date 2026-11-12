@@ -75,7 +75,7 @@ class DrainWithAnIdleWorker(unittest.IsolatedAsyncioTestCase):
     async def test_it_stops_on_idle_despite_the_heartbeats(self):
         # Beats arrive every 10s of fake time against a 20s idle window. If an
         # announcement reset the timer, this would run to max_seconds instead.
-        received, stopped_by = await self.drain()
+        _, stopped_by = await self.drain()
         self.assertEqual(stopped_by, "idle")
 
     async def test_the_announcement_is_still_reported(self):
