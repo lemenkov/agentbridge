@@ -110,12 +110,17 @@ async def drain(
                 await asyncio.sleep(0.5)
                 continue
             async with message.process():
-                last = time.monotonic()
                 try:
                     payload = json.loads(message.body.decode())
                 except json.JSONDecodeError:
                     payload = {"body": message.body.decode(errors="replace")}
                 received.append(payload)
+                # An idle announcement says nothing is happening, and the bridge
+                # repeats it while a worker stays idle (so it can carry a TTL
+                # and not outlive its worker). Letting it reset the idle timer
+                # would mean collect never returns while any worker is free.
+                if payload.get("type") != "waiting_for_input":
+                    last = time.monotonic()
             if payload.get("type") == "done":
                 done_count += 1
                 if done and done_count >= done:

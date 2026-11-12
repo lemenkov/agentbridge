@@ -57,6 +57,26 @@ class FoldMessages(unittest.TestCase):
         msgs = [{"agent_id": "a", "type": "waiting_for_input", "body": "idle"}]
         self.assertEqual(fold_messages(msgs), [{"agent_id": "a", "type": "waiting"}])
 
+    def test_repeated_waiting_folds_to_one_entry_per_agent(self):
+        # The bridge repeats the announcement while a worker stays idle, so a
+        # minutes-long collect sees several; they say nothing the first did not.
+        wait = lambda a: {"agent_id": a, "type": "waiting_for_input", "body": "idle"}
+        msgs = [wait("a"), wait("b"), wait("a"), wait("a")]
+        self.assertEqual(fold_messages(msgs), [
+            {"agent_id": "a", "type": "waiting"},
+            {"agent_id": "b", "type": "waiting"},
+        ])
+
+    def test_waiting_does_not_disturb_a_result_from_the_same_agent(self):
+        msgs = [out("a", "t1", "x"),
+                {"agent_id": "a", "type": "waiting_for_input", "body": "idle"},
+                {"agent_id": "a", "type": "waiting_for_input", "body": "idle"},
+                done("a", "t1")]
+        folded = fold_messages(msgs)
+        self.assertEqual([e["type"] for e in folded], ["result", "waiting"])
+        self.assertEqual(folded[0]["body"], "x")
+        self.assertTrue(folded[0]["done"])
+
 
 if __name__ == "__main__":
     unittest.main()

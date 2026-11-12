@@ -65,16 +65,22 @@ def fold_messages(messages: list[dict]) -> list[dict]:
     The bridge publishes every non-empty stdout line as its own ``output``
     message and ends each task with a ``done`` message carrying ``rc``. This
     joins the lines of each task, in arrival order, into a single ``body``.
-    ``waiting_for_input`` messages pass through as their own entries. A result
-    whose ``done`` has not arrived yet has ``done: False`` and ``rc: None``.
+    ``waiting_for_input`` messages pass through as their own entries, at most
+    one per agent: the bridge repeats that announcement while the worker stays
+    idle (so the message can carry a TTL and not outlive its worker), and the
+    repeats say nothing the first one did not. A result whose ``done`` has not
+    arrived yet has ``done: False`` and ``rc: None``.
     """
     results: list[dict] = []
     open_by_key: dict[tuple, dict] = {}
+    waiting_agents: set[str] = set()
     for msg in messages:
         agent = msg.get("agent_id", "?")
         kind = msg.get("type", "output")
         if kind == "waiting_for_input":
-            results.append({"agent_id": agent, "type": "waiting"})
+            if agent not in waiting_agents:
+                waiting_agents.add(agent)
+                results.append({"agent_id": agent, "type": "waiting"})
             continue
         key = (agent, msg.get("task_id"))
         entry = open_by_key.get(key)
@@ -161,6 +167,10 @@ async def cmd_collect(args: argparse.Namespace) -> None:
     start = last = time.monotonic()
     received: list[dict] = []
     done_count = 0
+    # Agents whose idle announcement has already been printed. The bridge
+    # repeats it every 30s while a worker is idle; echoing each repeat would
+    # bury the output a long collect exists to show.
+    announced_idle: set[str] = set()
     # basic_get polling: a timed-out async-iterator read corrupts aio_pika's
     # queue iterator, so we poll instead.
     while True:
@@ -175,13 +185,18 @@ async def cmd_collect(args: argparse.Namespace) -> None:
             await asyncio.sleep(1.0)
             continue
         async with message.process():
-            last = time.monotonic()
             try:
                 payload = json.loads(message.body.decode())
             except json.JSONDecodeError:
                 payload = {"body": message.body.decode(errors="replace")}
             received.append(payload)
             kind = payload.get("type")
+            # An idle announcement is a statement that nothing is happening, so
+            # it must not extend the idle window — the bridge repeats it every
+            # 30s while a worker sits idle, and counting that as activity would
+            # mean --idle never fires while any worker is free.
+            if kind != "waiting_for_input":
+                last = time.monotonic()
             line = payload.get("body", "")
             if kind == "done":
                 done_count += 1
@@ -192,9 +207,13 @@ async def cmd_collect(args: argparse.Namespace) -> None:
                     print(f"[collect] {done_count} task(s) done — stop")
                     break
                 continue
-            if not args.grouped:
-                tag = "WAIT" if kind == "waiting_for_input" else "OUT"
-                print(f"[{tag}|{payload.get('agent_id', '?')}] {line}")
+            agent = payload.get("agent_id", "?")
+            if kind == "waiting_for_input":
+                if not args.grouped and agent not in announced_idle:
+                    print(f"[WAIT|{agent}] {line}")
+                announced_idle.add(agent)
+            elif not args.grouped:
+                print(f"[OUT|{agent}] {line}")
             if args.until and args.until in line:
                 print("[collect] matched --until — stop")
                 break

@@ -56,6 +56,19 @@ KILL_GRACE = 10.0
 # 5.5 s on this host, so this is generous without being unbounded.
 STOP_TIMEOUT = 30.0
 
+# A `waiting` announcement is only true while the worker that published it is
+# alive, but the collector queue is durable, so without an expiry the message
+# outlives the worker — `collect` then reports an idle worker that was retired
+# yesterday, and an orchestrator following its instructions ("respond to idle
+# workers with a next task") dispatches into a queue with no consumer. A TTL
+# alone would trade that false positive for a lost true one: a worker that is
+# still idle when the TTL runs out would stop being reported. So the
+# announcement is also repeated while the worker stays idle, which makes it a
+# heartbeat: present for a live idle worker, gone within WAITING_TTL of the
+# worker's death. The TTL is three beats, so a missed one is not a disappearance.
+WAITING_REANNOUNCE = 30.0
+WAITING_TTL = 90.0
+
 # What a task that ran out of time reports. 124 is GNU timeout(1)'s code; the
 # leaf's own signal-derived code (-15) would read as a crash instead of a
 # deadline, and 0 would read as success.
@@ -281,11 +294,13 @@ async def bridge(
     if not log_content:
         logger.info("Content logging off: task/output/stderr text is not logged")
 
-    async def publish(routing_key: str, obj: dict) -> None:
+    async def publish(routing_key: str, obj: dict,
+                      expiration: float | None = None) -> None:
         await exch.publish(
             aio_pika.Message(
                 body=json.dumps(obj).encode(),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                expiration=expiration,
             ),
             routing_key=routing_key,
         )
@@ -598,7 +613,9 @@ async def bridge(
     status.set("idle")
 
     last_activity = time.monotonic()
-    idle_announced = False
+    # When the current idle announcement was published; None while the worker
+    # has not yet been idle long enough to announce at all.
+    idle_announced_at: float | None = None
     stop = False
 
     while not stop:
@@ -611,14 +628,21 @@ async def bridge(
             if message is not None:
                 break
         if message is None:
-            if not idle_announced and (time.monotonic() - last_activity) > idle_timeout:
+            now = time.monotonic()
+            if idle_announced_at is None:
+                due = (now - last_activity) > idle_timeout
+            else:
+                due = (now - idle_announced_at) >= WAITING_REANNOUNCE
+            if due:
                 await publish(waiting_key, {
                     "agent_id": agent_id,
                     "type": "waiting_for_input",
                     "body": f"Agent {agent_id} is idle and waiting for instructions",
-                })
-                logger.info("Agent %s idle — announced on %s", agent_id, waiting_key)
-                idle_announced = True
+                }, expiration=WAITING_TTL)
+                if idle_announced_at is None:
+                    logger.info("Agent %s idle — announcing on %s every %gs",
+                                agent_id, waiting_key, WAITING_REANNOUNCE)
+                idle_announced_at = now
             await asyncio.sleep(1.0)
             continue
 
@@ -756,7 +780,7 @@ async def bridge(
                 await publish(outbox, done)
 
         last_activity = time.monotonic()
-        idle_announced = False
+        idle_announced_at = None
 
     await connection.close()
     status.remove()

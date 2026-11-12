@@ -47,9 +47,13 @@ class FakeQueue:
 class FakeExchange:
     def __init__(self):
         self.published: list[tuple[str, dict]] = []
+        # (routing_key, expiration) per publish, so a test can assert that a
+        # message was given a TTL and not only that it was sent.
+        self.expirations: list[tuple[str, object]] = []
 
     async def publish(self, message, routing_key):
         self.published.append((routing_key, json.loads(message.body.decode())))
+        self.expirations.append((routing_key, message.expiration))
 
 
 class FakeChannel:
@@ -511,3 +515,72 @@ class Failures(TaskRun):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdleAnnouncement(TaskRun):
+    """The `waiting` announcement must perish with its worker.
+
+    The collector queue is durable, so a `waiting` published once outlives the
+    worker: `collect` then reports an idle worker that was retired a day
+    earlier, and the server's own instructions tell an orchestrator to send
+    that worker a task — into a queue with no consumer. The fix is a TTL, which
+    only works if the announcement repeats while the worker is genuinely still
+    idle; otherwise the TTL would silently drop a true signal.
+    """
+
+    class IdleThenShutdown:
+        """Returns nothing for `nones` polls, then a shutdown."""
+
+        def __init__(self, nones):
+            self._left = nones
+
+        async def bind(self, *a, **kw):
+            return None
+
+        async def get(self, fail=False):
+            if self._left > 0:
+                self._left -= 1
+                return None
+            return FakeMessage({"type": "shutdown"})
+
+    async def run_idle(self, nones):
+        queue = self.IdleThenShutdown(nones)
+        channel = FakeChannel(self.exchange, queue)
+        with mock.patch.object(
+            bridge.aio_pika, "connect_robust",
+            new=mock.AsyncMock(return_value=FakeConnection(channel)),
+        ), mock.patch.object(bridge, "WAITING_REANNOUNCE", 0.0):
+            await asyncio.wait_for(bridge.bridge(
+                agent_id="researcher-1",
+                amqp_url="amqp://fake/",
+                exchange="agents",
+                inbox_topic="researcher-1.inbox",
+                work_topic=None,
+                outbox_topic=None,
+                idle_timeout=0.0,
+                preamble="PREAMBLE",
+                command=[sys.executable, "-c", "pass"],
+                driver_name="claude-print",
+                role="researcher",
+            ), timeout=60)
+
+    def waiting_ttls(self):
+        return [exp for key, exp in self.exchange.expirations
+                if key == "researcher-1.waiting"]
+
+    async def test_the_announcement_carries_a_ttl(self):
+        await self.run_idle(1)
+        self.assertEqual(
+            self.sent("researcher-1.waiting", "waiting_for_input").__len__(), 1)
+        self.assertEqual(self.waiting_ttls(), [bridge.WAITING_TTL])
+
+    async def test_it_repeats_while_the_worker_stays_idle(self):
+        # Without the repeat, a worker still idle when the TTL expires would
+        # vanish from `collect` -- a lost true signal in place of a stale one.
+        await self.run_idle(3)
+        ttls = self.waiting_ttls()
+        self.assertEqual(len(ttls), 3)
+        self.assertEqual(set(ttls), {bridge.WAITING_TTL})
+
+    async def test_the_ttl_is_several_beats_so_a_missed_one_is_not_a_death(self):
+        self.assertGreaterEqual(bridge.WAITING_TTL, 2 * bridge.WAITING_REANNOUNCE)
