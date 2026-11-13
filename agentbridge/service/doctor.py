@@ -32,10 +32,14 @@ Three deliberate choices:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import stat
+import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -67,6 +71,30 @@ class Finding:
 Probe = Callable[[str], tuple[int | None, bytes, str]]
 # A runner is `admin._as_service_user`-shaped: argv in, completed process out.
 Runner = Callable[..., object]
+# A lister answers "what is in our nft table", as (rc, stdout, stderr). Reading
+# the ruleset needs root, so a non-root caller gets a non-zero rc and a reason,
+# which is a skip rather than a failure.
+Lister = Callable[[], tuple[int, str, str]]
+
+NFT_FAMILY = "inet"
+NFT_TABLE = "agentbridge"
+NFT_CHAIN = "leaf_egress"
+
+
+def nft_lister(timeout: float = PROBE_TIMEOUT) -> tuple[int, str, str]:
+    """Ask `nft` for our table as JSON.
+
+    JSON rather than the text form on purpose: the text form is meant to be
+    re-parsed by `nft`, not by us, and a check that scrapes it would start
+    lying the first time nftables changed how it renders a rule.
+    """
+    try:
+        proc = subprocess.run(
+            ["nft", "-j", "list", "table", NFT_FAMILY, NFT_TABLE],
+            capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def http_probe(url: str, timeout: float = PROBE_TIMEOUT
@@ -328,11 +356,202 @@ def check_images(runner: Runner | None = None) -> list[Finding]:
     return out
 
 
+def _elem_value(elem: object) -> str | None:
+    """One set element's value. `nft -j` wraps it when it carries a comment."""
+    if isinstance(elem, str):
+        return elem
+    if isinstance(elem, dict):
+        inner = elem.get("elem", elem)
+        if isinstance(inner, dict) and isinstance(inner.get("val"), str):
+            return inner["val"]
+    return None
+
+
+def _nft_sets(parsed: dict) -> dict[str, set[str]]:
+    """Every set in our table, as name -> element values."""
+    out: dict[str, set[str]] = {}
+    for item in parsed.get("nftables", []):
+        if not isinstance(item, dict):
+            continue
+        spec = item.get("set")
+        if not isinstance(spec, dict) or spec.get("table") != NFT_TABLE:
+            continue
+        values = {v for v in (_elem_value(e) for e in spec.get("elem") or []) if v}
+        out[str(spec.get("name"))] = values
+    return out
+
+
+def _nft_chains(parsed: dict) -> set[str]:
+    return {str(item["chain"].get("name"))
+            for item in parsed.get("nftables", [])
+            if isinstance(item, dict) and isinstance(item.get("chain"), dict)
+            and item["chain"].get("table") == NFT_TABLE}
+
+
+def _chain_has_drop(parsed: dict, chain: str) -> bool:
+    """Does `chain` end a packet's journey with `drop` anywhere in it?
+
+    This is how the two policy files are told apart without reading either of
+    them: the enforcing one closes `leaf_egress` with `counter drop`, the audit
+    one with a counter and a log and no verdict at all.
+    """
+    for item in parsed.get("nftables", []):
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule")
+        if not isinstance(rule, dict) or rule.get("chain") != chain:
+            continue
+        for expr in rule.get("expr") or []:
+            if isinstance(expr, dict) and "drop" in expr:
+                return True
+    return False
+
+
+def _endpoint_addresses(url: str) -> tuple[list[str], str]:
+    """The addresses an endpoint resolves to, and why not if it does not.
+
+    A literal address is taken as it stands. A name is resolved, because what
+    the policy has to allow is an address — but a resolution failure is DNS's
+    problem, not the policy's, so it is reported and not blamed on the sets.
+    """
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        return [], f"no host in {url!r}"
+    try:
+        return [str(ipaddress.ip_address(host))], ""
+    except ValueError:
+        pass
+    try:
+        info = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        return [], f"{host} does not resolve: {exc}"
+    return sorted({str(entry[4][0]) for entry in info}), ""
+
+
+def check_netpolicy(lister: Lister | None = None,
+                    path: Path | None = None) -> list[Finding]:
+    """Is the leaf egress policy loaded, and does its allowlist still match?
+
+    Three separate questions, because they fail separately.
+
+    **Is it there at all?** `agentbridge-nft.service` runs `nft -f` once and
+    asserts nothing afterwards, so `active (exited)` means "that one load
+    succeeded", not "the policy is in the kernel now". The unit would report
+    success just as cheerfully with the ruleset flushed underneath it. On
+    2026-11-13 the same shape cost this host six hours of LAN access, with
+    systemd reporting success throughout.
+
+    **Which file is loaded?** The audit policy logs and drops nothing; the
+    enforcing one drops. Believing enforcement is on while the audit file is
+    loaded is the quiet failure this check exists for, which is why the audit
+    case is a `warn` and not an `ok` — `--quiet` hides `ok`, and this is
+    precisely the line an operator must not stop seeing.
+
+    **Does the allowlist still match `backends.toml`?** The sets are
+    hand-written until E.4's `agentbridge-netpolicy` renders them, so they
+    drift. A configured endpoint missing from the sets is a leaf that the
+    enforcing policy will silently drop; an address left behind after a backend
+    is removed is a permission nobody meant to keep.
+    """
+    rc, out, err = (lister or nft_lister)()
+    if rc != 0:
+        reason = (err or out or "nft failed").strip().splitlines()[-1]
+        low = reason.lower()
+        if "permitted" in low or "permission" in low or "denied" in low:
+            return [Finding("leaf netpolicy", SKIP,
+                            f"cannot read the ruleset as this user — run "
+                            f"`agentbridge-admin doctor` as root ({reason})")]
+        if "no such file" in low or "does not exist" in low:
+            return [Finding("leaf netpolicy", FAIL,
+                            f"table {NFT_FAMILY} {NFT_TABLE} is not loaded: "
+                            f"the leaf egress policy is not in the kernel. "
+                            f"`systemctl status agentbridge-nft.service` may "
+                            f"still say active — it only ran `nft -f` once")]
+        return [Finding("leaf netpolicy", FAIL, f"nft failed: {reason}")]
+
+    try:
+        parsed = json.loads(out or "{}")
+    except ValueError:
+        return [Finding("leaf netpolicy", FAIL,
+                        "nft -j did not return JSON")]
+    if not isinstance(parsed, dict):
+        return [Finding("leaf netpolicy", FAIL,
+                        "nft -j did not return JSON")]
+
+    findings: list[Finding] = []
+    chains = _nft_chains(parsed)
+    if NFT_CHAIN not in chains:
+        findings.append(Finding("leaf netpolicy", FAIL,
+                                f"table {NFT_FAMILY} {NFT_TABLE} is loaded but "
+                                f"has no {NFT_CHAIN} chain (has: "
+                                f"{', '.join(sorted(chains)) or 'nothing'})"))
+        return findings
+
+    if _chain_has_drop(parsed, NFT_CHAIN):
+        findings.append(Finding("leaf netpolicy", OK,
+                                f"enforcing: {NFT_CHAIN} drops what it does not "
+                                f"allow"))
+    else:
+        findings.append(Finding("leaf netpolicy", WARN,
+                                f"audit only: {NFT_CHAIN} has no drop, so "
+                                f"nothing is blocked — this is the dry-run "
+                                f"file, not the enforcing one (step 0.1e)"))
+
+    sets = _nft_sets(parsed)
+    allowed = set().union(*sets.values()) if sets else set()
+    try:
+        loaded = backends_mod.load(path)
+    except backends_mod.BackendError:
+        findings.append(Finding("netpolicy allowlist", SKIP,
+                                "not compared: backends.toml does not load"))
+        return findings
+
+    wanted: dict[str, str] = {}     # address -> the backend that wants it
+    for name, backend in sorted(loaded.items()):
+        if backend.kind == "anthropic":
+            # Reached over the internet on 443, which the policy allows for
+            # every leaf; it is not an allowlisted address.
+            continue
+        for endpoint in backend.endpoints:
+            addresses, why = _endpoint_addresses(endpoint.url)
+            if not addresses:
+                findings.append(Finding(f"netpolicy {name}", SKIP,
+                                        f"not compared: {why}"))
+                continue
+            if not any(a in allowed for a in addresses):
+                findings.append(Finding(f"netpolicy {name}", FAIL,
+                                        f"{endpoint.url} resolves to "
+                                        f"{', '.join(addresses)}, none of which "
+                                        f"is in the policy's allow sets — the "
+                                        f"enforcing policy drops this backend"))
+            else:
+                findings.append(Finding(f"netpolicy {name}", OK,
+                                        f"{endpoint.url} is allowed"))
+            for address in addresses:
+                wanted.setdefault(address, name)
+
+    stale = sorted(a for a in allowed if a not in wanted)
+    if stale:
+        findings.append(Finding("netpolicy allowlist", WARN,
+                                f"allowed but not in backends.toml: "
+                                f"{', '.join(stale)} — a permission outliving "
+                                f"the backend that needed it"))
+    elif allowed:
+        findings.append(Finding("netpolicy allowlist", OK,
+                                f"{len(allowed)} allowed address(es), all "
+                                f"declared in backends.toml"))
+    else:
+        findings.append(Finding("netpolicy allowlist", OK,
+                                "empty, and no non-hosted backend is declared"))
+    return findings
+
+
 # ------------------------------------------------------------------ driving
 
 
 def run_all(probe: Probe = http_probe, runner: Runner | None = None,
-            path: Path | None = None) -> list[Finding]:
+            path: Path | None = None,
+            lister: Lister | None = None) -> list[Finding]:
     """Every check, in the order an operator would want to read them."""
     return [
         *check_backends(path),
@@ -340,6 +559,9 @@ def run_all(probe: Probe = http_probe, runner: Runner | None = None,
         *check_binaries(),
         *check_roles(path),
         *check_images(runner),
+        # Before the reachability checks on purpose: if the policy blocks an
+        # endpoint, "unreachable" below is the symptom and this is the cause.
+        *check_netpolicy(lister, path),
         *check_endpoints(probe, path),
         *check_models(probe, path),
     ]

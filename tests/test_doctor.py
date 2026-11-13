@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agentbridge.service import config, doctor
+from agentbridge.service import backends, config, doctor
 from agentbridge.service.roles import Role
 
 
@@ -36,6 +36,33 @@ def probe_returning(mapping):
 
 def tags(*names):
     return json.dumps({"models": [{"name": n} for n in names]}).encode()
+
+
+def ruleset(*, chain="leaf_egress", drop=True, v4=(), v6=(), table="agentbridge"):
+    """What `nft -j list table inet agentbridge` answers, in the shape it does."""
+    items = [
+        {"metainfo": {"version": "1.1.6"}},
+        {"table": {"family": "inet", "name": table}},
+        {"set": {"family": "inet", "table": table, "name": "backends_v4",
+                 "type": "ipv4_addr", "elem": list(v4)}},
+        {"set": {"family": "inet", "table": table, "name": "backends_v6",
+                 "type": "ipv6_addr", "elem": list(v6)}},
+        {"chain": {"family": "inet", "table": table, "name": "egress"}},
+    ]
+    if chain:
+        items.append({"chain": {"family": "inet", "table": table, "name": chain}})
+        expr = [{"counter": {"packets": 0, "bytes": 0}}]
+        if drop:
+            expr.append({"drop": None})
+        items.append({"rule": {"family": "inet", "table": table,
+                               "chain": chain, "expr": expr}})
+    return json.dumps({"nftables": items})
+
+
+def lister(payload="", rc=0, err=""):
+    def _lister():
+        return rc, payload, err
+    return _lister
 
 
 OLLAMA = """
@@ -235,6 +262,165 @@ class Images(unittest.TestCase):
             self.assertNotIn("run", argv)
 
 
+class NetPolicy(TempFiles):
+    """The leaf egress policy: loaded, which one, and still matching config."""
+
+    def test_a_ruleset_we_cannot_read_is_skipped_not_passed(self):
+        # The whole point of `skip`: doctor runs as a non-root operator too,
+        # and "I could not look" must never render as "it is fine".
+        [finding] = doctor.check_netpolicy(
+            lister(rc=1, err="Error: Could not process rule: Operation not "
+                             "permitted"))
+        self.assertEqual(finding.level, doctor.SKIP)
+        self.assertIn("as root", finding.detail)
+
+    def test_a_table_that_is_not_loaded_fails(self):
+        [finding] = doctor.check_netpolicy(
+            lister(rc=1, err="Error: Could not process rule: No such file or "
+                             "directory"))
+        self.assertEqual(finding.level, doctor.FAIL)
+        self.assertIn("not loaded", finding.detail)
+
+    def test_it_says_the_unit_can_report_active_with_nothing_loaded(self):
+        # This is the finding's reason for existing: `nft -f` ran once, and
+        # systemd has been reporting success ever since. An operator reading
+        # only `systemctl status` would conclude the opposite of the truth.
+        [finding] = doctor.check_netpolicy(
+            lister(rc=1, err="No such file or directory"))
+        self.assertIn("agentbridge-nft.service", finding.detail)
+        self.assertIn("once", finding.detail)
+
+    def test_junk_instead_of_json_fails(self):
+        [finding] = doctor.check_netpolicy(lister("not json at all"))
+        self.assertEqual(finding.level, doctor.FAIL)
+
+    def test_a_loaded_table_with_no_leaf_chain_fails(self):
+        [finding] = doctor.check_netpolicy(lister(ruleset(chain=None)))
+        self.assertEqual(finding.level, doctor.FAIL)
+        self.assertIn("leaf_egress", finding.detail)
+
+    def test_the_enforcing_policy_passes_and_says_so(self):
+        path = self.write("b.toml", OLLAMA)
+        findings = doctor.check_netpolicy(
+            lister(ruleset(drop=True, v4=["127.0.0.1"])), path)
+        self.assertEqual(findings[0].level, doctor.OK)
+        self.assertIn("enforcing", findings[0].detail)
+
+    def test_the_audit_policy_warns_rather_than_passes(self):
+        # `--quiet` hides `ok`. Reporting the dry-run file as `ok` would mean
+        # an operator checking a host quietly could not tell enforcement off
+        # from enforcement on -- the exact confusion this check exists for.
+        path = self.write("b.toml", OLLAMA)
+        findings = doctor.check_netpolicy(
+            lister(ruleset(drop=False, v4=["127.0.0.1"])), path)
+        self.assertEqual(findings[0].level, doctor.WARN)
+        self.assertIn("audit", findings[0].detail)
+        self.assertIn("0.1e", findings[0].detail)
+
+    def test_a_backend_absent_from_the_allow_sets_fails(self):
+        path = self.write("b.toml", OLLAMA)
+        findings = doctor.check_netpolicy(lister(ruleset(v4=[])), path)
+        bad = [f for f in findings if f.level == doctor.FAIL]
+        self.assertTrue(bad)
+        self.assertIn("127.0.0.1", bad[0].detail)
+        self.assertIn("drops this backend", bad[0].detail)
+
+    def test_a_backend_present_in_the_sets_passes(self):
+        path = self.write("b.toml", OLLAMA)
+        findings = doctor.check_netpolicy(
+            lister(ruleset(v4=["127.0.0.1"])), path)
+        self.assertEqual(self.levels(findings, "netpolicy local"), [doctor.OK])
+
+    def test_an_element_carrying_a_comment_is_read_the_same_way(self):
+        # `nft -j` wraps an element in an object once it has a comment, which
+        # a naive reader would see as "the set is empty".
+        path = self.write("b.toml", OLLAMA)
+        elem = {"elem": {"val": "127.0.0.1", "comment": "from backends.toml"}}
+        findings = doctor.check_netpolicy(lister(ruleset(v4=[elem])), path)
+        self.assertEqual(self.levels(findings, "netpolicy local"), [doctor.OK])
+
+    def test_an_address_outliving_its_backend_warns(self):
+        path = self.write("b.toml", OLLAMA)
+        findings = doctor.check_netpolicy(
+            lister(ruleset(v4=["127.0.0.1", "192.168.0.99"])), path)
+        stale = [f for f in findings if f.check == "netpolicy allowlist"]
+        self.assertEqual(stale[0].level, doctor.WARN)
+        self.assertIn("192.168.0.99", stale[0].detail)
+        self.assertNotIn("127.0.0.1", stale[0].detail)
+
+    def test_the_loader_is_why_a_hosted_backend_has_nothing_to_allowlist(self):
+        # The premise the check rests on, asserted rather than assumed: a
+        # config file simply cannot give an anthropic backend an endpoint.
+        path = self.write("b.toml",
+                          '[hosted]\nkind = "anthropic"\n'
+                          'endpoints = [{ url = "https://api.anthropic.com" }]\n')
+        with self.assertRaises(backends.BackendError) as caught:
+            backends.load(path)
+        self.assertIn("takes no `endpoints`", str(caught.exception))
+
+    def test_the_hosted_backend_is_not_expected_in_the_allow_sets(self):
+        # anthropic is reached over 443, which every leaf may use; it is not
+        # an allowlisted address, and demanding one would be a false failure.
+        #
+        # Built by hand rather than loaded, deliberately: the loader forbids
+        # this shape (see the test above), so going through a file would
+        # exercise nothing and the guard could be deleted with every test
+        # still green. This is the case the guard is insurance against --
+        # the loader relaxing that rule later.
+        hosted = backends.Backend(
+            name="hosted", kind="anthropic",
+            endpoints=(backends.Endpoint(url="https://api.anthropic.com"),))
+        with mock.patch.object(doctor.backends_mod, "load",
+                               return_value={"hosted": hosted}):
+            findings = doctor.check_netpolicy(lister(ruleset(v4=[])))
+        self.assertNotIn(doctor.FAIL, [f.level for f in findings])
+
+    def test_empty_sets_with_no_local_backend_is_not_a_finding(self):
+        path = self.write("b.toml", '[hosted]\nkind = "anthropic"\n')
+        findings = doctor.check_netpolicy(lister(ruleset(v4=[])), path)
+        last = findings[-1]
+        self.assertEqual(last.level, doctor.OK)
+        self.assertIn("no non-hosted backend", last.detail)
+
+    def test_a_name_that_does_not_resolve_is_skipped_not_blamed_on_the_policy(self):
+        path = self.write("b.toml", '[local]\nkind = "ollama"\n'
+                          'endpoints = [{ url = "http://mini.lan:11434" }]\n'
+                          'models = ["x"]\n')
+        with mock.patch("socket.getaddrinfo", side_effect=OSError("no address")):
+            findings = doctor.check_netpolicy(lister(ruleset(v4=[])), path)
+        mine = [f for f in findings if f.check == "netpolicy local"]
+        self.assertEqual(mine[0].level, doctor.SKIP)
+        self.assertIn("does not resolve", mine[0].detail)
+
+    def test_an_unloadable_backends_file_does_not_hide_the_policy_finding(self):
+        path = self.write("b.toml", '[local]\nkind = "ollama"\n')
+        findings = doctor.check_netpolicy(lister(ruleset(v4=[])), path)
+        self.assertEqual(findings[0].level, doctor.OK)       # still read it
+        self.assertEqual(findings[-1].level, doctor.SKIP)    # could not compare
+
+
+class NetPolicyRunsNothing(unittest.TestCase):
+    def test_the_default_lister_only_reads(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+
+        with mock.patch("subprocess.run", fake_run):
+            doctor.nft_lister()
+        self.assertEqual(seen["argv"][:2], ["nft", "-j"])
+        self.assertIn("list", seen["argv"])
+        for forbidden in ("add", "insert", "delete", "flush", "-f"):
+            self.assertNotIn(forbidden, seen["argv"])
+
+    def test_an_nft_that_is_not_installed_is_an_answer_not_a_crash(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("nft")):
+            rc, _out, err = doctor.nft_lister()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("nft", err)
+
+
 class ExitCode(unittest.TestCase):
     def test_only_a_failure_is_a_bad_exit(self):
         f = doctor.Finding
@@ -265,7 +451,8 @@ class RunAllSpawnsNothing(TempFiles):
         path = self.write("b.toml", OLLAMA)
         probe = probe_returning(
             {"http://127.0.0.1:11434/api/tags": (200, tags("llama3.2:3b"))})
-        findings = doctor.run_all(probe=probe, runner=runner, path=path)
+        findings = doctor.run_all(probe=probe, runner=runner, path=path,
+                                  lister=lister(ruleset(v4=["127.0.0.1"])))
         self.assertTrue(findings)
         self.assertTrue(calls)
         for argv in calls:
