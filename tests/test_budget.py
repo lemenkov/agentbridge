@@ -12,7 +12,7 @@ measuring, since a money figure from a subscription credential is an estimate.
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -22,7 +22,7 @@ from agentbridge.service.tenant import tenant_from_headers
 
 
 def stamp(**delta) -> str:
-    return (datetime.now(timezone.utc) - timedelta(**delta)).isoformat(
+    return (datetime.now(UTC) - timedelta(**delta)).isoformat(
         timespec="seconds")
 
 
@@ -225,6 +225,157 @@ class Validation(unittest.TestCase):
         for bad in ("lots", None, {}):
             with self.assertRaises(ValueError):
                 budget.validate_limit(bad, "max_cost_usd")
+
+
+class Windows(unittest.TestCase):
+    """A budget window is narrower than a ledger query, for two reasons."""
+
+    def test_a_relative_span_is_accepted_and_trimmed(self):
+        self.assertEqual(budget.validate_window(" 30d "), "30d")
+        self.assertEqual(budget.validate_window("24h"), "24h")
+        self.assertEqual(budget.validate_window("90m"), "90m")
+
+    def test_a_fixed_date_is_refused_even_though_the_ledger_parses_it(self):
+        # ledger.parse_since accepts it, so this is a deliberate narrowing:
+        # a bound that never rolls forward is not a window, and once spend
+        # crossed the line the limit would be permanent.
+        self.assertIsNotNone(ledger.parse_since("2026-10-28"))
+        with self.assertRaises(ValueError) as cm:
+            budget.validate_window("2026-10-28")
+        self.assertIn("never", str(cm.exception))
+
+    def test_a_zero_length_window_is_refused(self):
+        # The trap: 0d holds no tasks, so spend inside it is always 0 and the
+        # limit can never trip — enforcement off while the record claims a
+        # limit is on.
+        with self.assertRaises(ValueError) as cm:
+            budget.validate_window("0d")
+        self.assertIn("ever be reached", str(cm.exception))
+
+    def test_unparseable_spans_are_refused(self):
+        for bad in ("30", "d", "30s", "", "week"):
+            with self.assertRaises(ValueError):
+                budget.validate_window(bad)
+
+
+class SetLimits(BudgetBase):
+    """`set_budget`'s worker: one record rewritten, nothing else touched."""
+
+    def setUp(self):
+        super().setUp()
+        from agentbridge.service import provisioning, rabbit_mgmt
+        self.provisioning = provisioning
+        patch = mock.patch.object(rabbit_mgmt, "ensure_tenant")
+        self.ensure = patch.start()
+        self.addCleanup(patch.stop)
+        provisioning.provision("alice", max_cost_usd=1.0, max_tokens=100)
+        self.ensure.reset_mock()
+
+    def test_it_changes_only_what_it_was_given(self):
+        result = self.provisioning.set_limits("alice", max_tokens=5000)
+        self.assertEqual(result["max_tokens"], 5000)
+        self.assertEqual(result["max_cost_usd"], 1.0, "untouched field changed")
+        self.assertEqual(result["budget_window"], "30d")
+
+    def test_zero_removes_a_limit_rather_than_meaning_omitted(self):
+        result = self.provisioning.set_limits("alice", max_cost_usd=0)
+        self.assertEqual(result["max_cost_usd"], 0.0)
+        # The token limit survives, so something is still enforced.
+        self.assertTrue(result["usage"]["enforced"])
+        result = self.provisioning.set_limits("alice", max_tokens=0)
+        self.assertFalse(result["usage"]["enforced"])
+
+    def test_it_does_not_touch_the_broker(self):
+        # Not an optimisation: a budget change that failed because RabbitMQ
+        # was unreachable would be a baffling error to read.
+        self.provisioning.set_limits("alice", max_cost_usd=2.0)
+        self.ensure.assert_not_called()
+
+    def test_it_reports_usage_so_a_crossed_line_is_visible_at_once(self):
+        tenant = tenant_from_headers({config.USER_HEADER: "alice"})
+        self.spend(tenant, cost=0.5)
+        result = self.provisioning.set_limits("alice", max_cost_usd=0.25)
+        self.assertEqual(result["usage"]["cost_usd"], 0.5)
+        self.assertEqual(result["usage"]["cost_usd_remaining"], 0.0)
+
+    def test_setting_nothing_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            self.provisioning.set_limits("alice")
+        self.assertIn("nothing to set", str(cm.exception))
+
+    def test_an_unknown_tenant_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.provisioning.set_limits("ghost", max_cost_usd=1.0)
+
+    def test_a_bad_value_is_refused_before_the_record_is_rewritten(self):
+        before = (config.TENANTS_DIR / "alice.json").read_text()
+        for kw in ({"max_cost_usd": -5}, {"max_tokens": -1},
+                   {"max_cost_usd": "lots"}, {"budget_window": "0d"},
+                   {"budget_window": "2026-01-01"}):
+            with self.assertRaises(ValueError):
+                self.provisioning.set_limits("alice", **kw)
+        self.assertEqual((config.TENANTS_DIR / "alice.json").read_text(), before)
+
+    def test_provision_refuses_the_same_bad_values(self):
+        # The path that existed first, and the one that could write a negative
+        # limit straight into a record: validate_limit was called by nothing
+        # but its own tests until set_budget wired it in.
+        for kw in ({"max_cost_usd": -5}, {"max_tokens": -1},
+                   {"budget_window": "banana"}):
+            with self.assertRaises(ValueError):
+                self.provisioning.provision("alice", **kw)
+
+    def test_a_negative_limit_would_have_blocked_the_tenant_forever(self):
+        # Why the guard matters: a negative limit is not a loose one.
+        tenant = self.tenant(max_cost_usd=-5.0)
+        with self.assertRaises(budget.BudgetExceeded):
+            budget.check(tenant)
+
+
+class SetBudgetTool(BudgetBase, unittest.IsolatedAsyncioTestCase):
+    """The admin tool around it."""
+
+    def setUp(self):
+        super().setUp()
+        from agentbridge.service import admin_api, provisioning, rabbit_mgmt, ratelimit
+        self.admin_api = admin_api
+        patch = mock.patch.object(rabbit_mgmt, "ensure_tenant")
+        patch.start()
+        self.addCleanup(patch.stop)
+        provisioning.provision("alice", admin=True)
+        provisioning.provision("bob")
+        ratelimit.reset()
+        self.addCleanup(ratelimit.reset)
+
+    async def test_an_admin_can_set_another_tenant_s_budget(self):
+        result = await self.admin_api.set_budget(
+            "bob", max_tokens=1_000_000,
+            headers={config.USER_HEADER: "alice"})
+        self.assertEqual(result["user"], "bob")
+        self.assertEqual(result["max_tokens"], 1_000_000)
+        self.assertTrue(result["usage"]["enforced"])
+
+    async def test_a_plain_tenant_is_refused_and_nothing_changes(self):
+        before = (config.TENANTS_DIR / "alice.json").read_text()
+        result = await self.admin_api.set_budget(
+            "alice", max_cost_usd=999.0,
+            headers={config.USER_HEADER: "bob"})
+        self.assertFalse(result["success"])
+        self.assertIn("not an administrator", result["error"])
+        self.assertEqual((config.TENANTS_DIR / "alice.json").read_text(), before)
+
+    async def test_a_bad_window_comes_back_as_an_error_not_a_traceback(self):
+        result = await self.admin_api.set_budget(
+            "bob", budget_window="2026-01-01",
+            headers={config.USER_HEADER: "alice"})
+        self.assertFalse(result["success"])
+        self.assertIn("window", result["error"])
+
+    async def test_provision_user_also_returns_a_bad_window_as_an_error(self):
+        result = await self.admin_api.provision_user(
+            "bob", budget_window="banana",
+            headers={config.USER_HEADER: "alice"})
+        self.assertFalse(result["success"])
 
 
 class Enforcement(BudgetBase, unittest.IsolatedAsyncioTestCase):

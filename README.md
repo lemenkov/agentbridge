@@ -255,9 +255,13 @@ while it runs.
 per-worker state (`idle`, `working`, `gone`, …), the task and tool in flight,
 queue depths and 7-day usage. There is also a live page for humans at
 `/mcp/agentbridge/ui/`: topology, per-worker timeline lanes and recent tasks,
-updating over Server-Sent Events. It is read-only, shows agent output only when
-you ask it to, and renders every agent-supplied string as text under a
-`default-src 'none'` CSP — agent output is untrusted input.
+updating over Server-Sent Events. It also shows the budget: spend inside the
+window against each limit, what is left, and whether anything is enforced at
+all. It is read-only, shows agent output only when you ask it to, and renders
+every agent-supplied string as text under a `default-src 'none'` CSP — agent
+output is untrusted input. There is deliberately no POST: with no form to
+forge, the page needs no CSRF defence, so setting a budget is an admin tool
+rather than a button.
 
 Each finished task appends one metadata line — ids, model, exit code, duration,
 turns, tokens, cost — to a per-user ledger kept **outside** the workspace, so an
@@ -297,7 +301,13 @@ are skipped and say so.
 Provisioning lives on a **separate endpoint** (`/mcp/agentbridge-admin`, its own
 port) so that an orchestrator reading untrusted agent output holds no handle to
 the tools that create and delete tenants; reaching it is not enough, the
-caller's tenant record must also say `"admin": true`.
+caller's tenant record must also say `"admin": true`. Its tools are
+`provision_user`, `set_budget`, `deprovision_user` and `list_users`.
+`set_budget` changes one tenant's limits and nothing else — **0 means no
+limit**, so a limit is removed by setting it to 0 rather than by omitting it —
+and it returns current usage with them, so a line you have just crossed is
+visible immediately. The window must be relative (`30d`, `24h`): a fixed date
+is refused, because its bound would never roll forward.
 
 `setup-host.sh` prints the remaining manual steps: the nginx locations
 (`deploy/nginx-location.conf`), binding RabbitMQ to loopback, and registering

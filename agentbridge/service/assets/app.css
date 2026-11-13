@@ -154,3 +154,30 @@ h2 {
 .events .when { color: var(--muted); }
 .events .what { font-weight: 600; }
 .empty { color: var(--muted); padding: 0.5rem 0; }
+
+/* ------------------------------------------------------------------ budget */
+
+.budget { display: flex; flex-direction: column; gap: 0.4rem; }
+
+.budget-head { margin: 0 0 0.2rem; display: flex; align-items: center; gap: 0.5rem; }
+.budget-window { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.badge { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 999px;
+         border: 1px solid currentColor; }
+.badge-on  { color: var(--ok); }
+.badge-off { color: var(--muted); }
+
+.budget-row { display: grid; grid-template-columns: 4.5rem 1fr auto; gap: 0.6rem;
+              align-items: center; }
+.budget-label { color: var(--muted); }
+.budget-figures { font-variant-numeric: tabular-nums; }
+
+.budget-bar { width: 100%; height: 8px; display: block; }
+.budget-track { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.budget-fill { fill: var(--ok); }
+.budget-fill.near { fill: var(--warn); }
+.budget-fill.over { fill: var(--bad); }
+
+.budget-note, .budget-error { margin: 0.2rem 0 0; color: var(--muted);
+                              font-size: 0.8rem; max-width: 60ch; }
+.budget-error { color: var(--bad); }

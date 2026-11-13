@@ -45,6 +45,17 @@ class Assets(unittest.TestCase):
         self.assertNotRegex(self.html, r"(?i)\sstyle\s*=")
         self.assertNotRegex(self.html, r"(?i)\son(click|load|error|mouseover)\s*=")
 
+    def test_the_renderer_sets_no_inline_style_either(self):
+        # The HTML carries no style attribute (above), but the renderer could
+        # still add one. `style-src 'self'` has no unsafe-inline, so sizing
+        # the budget bar with `element.style.width` would be relying on CSP's
+        # CSSOM exemption — true today, and not something this page needs to
+        # depend on. The bar is SVG with a width *attribute*, exactly as the
+        # lane bars already are.
+        self.assertNotRegex(self.js, r"\.style\.[A-Za-z]")
+        self.assertNotRegex(self.js, r"\.setAttribute\(\s*[\"']style[\"']")
+        self.assertNotRegex(self.js, r"\.style\.setProperty\s*\(")
+
     def test_no_remote_origins(self):
         for text in (self.html, (ASSETS / "app.css").read_text(), self.js):
             self.assertNotIn("http://", text.replace("http://www.w3.org", ""))

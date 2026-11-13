@@ -30,6 +30,7 @@ would mean nothing.
 from __future__ import annotations
 
 import logging
+import re
 
 from .. import ledger
 from .tenant import Tenant
@@ -38,9 +39,50 @@ log = logging.getLogger("mcp-agentbridge")
 
 COUNTED_TOKEN_FIELDS = ("input_tokens", "output_tokens")
 
+# A budget window is deliberately narrower than a ledger query: relative only,
+# and at least one unit long. See `validate_window`.
+_WINDOW = re.compile(r"^(\d+)([dhm])$")
+
 
 class BudgetExceeded(Exception):
     """The tenant is out of budget (reported to the caller, not raised at them)."""
+
+
+def validate_window(spec: str) -> str:
+    """Return a usable budget window, or raise ``ValueError`` saying why not.
+
+    **Validate on the way in, because the damage is on the way out.** A bad
+    window does not break the budget report — it breaks *dispatch*. ``check``
+    runs before every task, so a window the ledger cannot parse turns into a
+    refusal on every ``send_task`` for that tenant. The moment to refuse it is
+    the moment someone sets it, when there is a human to tell.
+
+    Two things are rejected that ``ledger.parse_since`` accepts:
+
+    * **An absolute date.** It parses, but it is not a window: the bound never
+      rolls forward, so spend accumulates against it until the end of time and
+      the limit becomes permanent once reached.
+    * **Zero.** ``0d`` is a window containing no tasks, so the spend inside it
+      is always 0 and the limit can never trip. That is enforcement switched
+      off while the record still claims a limit — worse than no limit at all,
+      which at least reports ``enforced: false``.
+    """
+    text = str(spec).strip()
+    m = _WINDOW.match(text)
+    if not m:
+        raise ValueError(
+            f"invalid budget window {spec!r}: use a relative span such as 30d, "
+            f"24h or 90m. A fixed date is not a window — its bound would never "
+            f"roll forward."
+        )
+    if int(m.group(1)) < 1:
+        raise ValueError(
+            f"invalid budget window {spec!r}: a zero-length window holds no "
+            f"tasks, so no limit measured over it could ever be reached."
+        )
+    # Belt and braces: the ledger is what actually has to parse this.
+    ledger.parse_since(text)
+    return text
 
 
 def usage(tenant: Tenant) -> dict:

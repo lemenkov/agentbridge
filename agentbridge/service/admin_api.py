@@ -115,11 +115,63 @@ async def provision_user(
             max_cost_usd=max_cost_usd, max_tokens=max_tokens,
             budget_window=budget_window,
         )
-    except (TenantError, ratelimit.RateLimited) as e:
+    except (TenantError, ValueError, ratelimit.RateLimited) as e:
+        # ValueError is a rejected argument — a bad username or an
+        # unparseable budget window — and belongs in the reply, not in a
+        # traceback the caller cannot read.
         log.info("user=%s tool=provision_user outcome=refused", caller.name)
         return _fail(e)
     log.info("user=%s tool=provision_user outcome=ok target=%s admin=%s password=%s",
              caller.name, name, result["admin"], "issued" if result["password"] else "kept")
+    return result
+
+
+@admin_mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
+                             "openWorldHint": False})
+async def set_budget(
+    name: str,
+    max_cost_usd: float | None = None,
+    max_tokens: int | None = None,
+    budget_window: str | None = None,
+    headers: dict = _current_headers,
+) -> dict:
+    """Set one tenant's spend limits, and report what they have spent.
+
+    **0 means no limit** — so a limit is removed by setting it to 0, not by
+    omitting it. An omitted argument is left exactly as it was.
+
+    `budget_window` is a relative span (`30d`, `24h`, `90m`); a fixed date is
+    refused, because its bound would never roll forward.
+
+    Both limits are a **brake, not a cap**: the check runs before a task is
+    dispatched, so the last task admitted can carry the total past the line by
+    its own cost, which nothing can know in advance. What they guarantee is
+    that no *new* task starts afterwards.
+
+    On a subscription credential (`key_source: none`) the cost figure is the
+    CLI's own estimate of what the work would have cost on the API rather than
+    money billed, so the token limit is the one measuring something real
+    there. Cache reads are excluded from the token count on purpose.
+
+    Returns the limits now in force plus current usage inside the window, so
+    you can see immediately whether a limit you just set is already crossed.
+    """
+    try:
+        caller = require_admin(headers)
+    except TenantError as e:
+        return _fail(e)
+    try:
+        ratelimit.check(caller.name, "set_budget")
+        result = await asyncio.to_thread(
+            provisioning.set_limits, name, max_cost_usd=max_cost_usd,
+            max_tokens=max_tokens, budget_window=budget_window,
+        )
+    except (TenantError, ValueError, ratelimit.RateLimited) as e:
+        log.info("user=%s tool=set_budget outcome=refused", caller.name)
+        return _fail(e)
+    log.info("user=%s tool=set_budget outcome=ok target=%s cost=%s tokens=%s window=%s",
+             caller.name, name, result["max_cost_usd"], result["max_tokens"],
+             result["budget_window"])
     return result
 
 

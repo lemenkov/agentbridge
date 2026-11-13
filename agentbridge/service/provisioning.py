@@ -26,7 +26,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import config, htpasswd, rabbit_mgmt
+from . import budget, config, htpasswd, rabbit_mgmt
 from . import secrets as secrets_mod
 from .tenant import (
     CREDENTIAL_KINDS,
@@ -55,6 +55,23 @@ def _ensure_dir(path: Path, mode: int, owner: Owner = None) -> None:
         os.chown(path, *owner)
 
 
+def _validate_limits(max_cost_usd, max_tokens, budget_window):
+    """Check the three budget fields, leaving ``None`` (meaning "unchanged").
+
+    ``budget.validate_limit`` existed before this and was called by nothing but
+    its own tests, so a negative limit could be written straight into a record
+    — and a negative limit is not a loose one, it is a **permanent block**:
+    `spent >= -5` is true before any task runs. Wiring it in here is the fix.
+    """
+    if max_cost_usd is not None:
+        max_cost_usd = budget.validate_limit(max_cost_usd, "max_cost_usd")
+    if max_tokens is not None:
+        max_tokens = int(budget.validate_limit(max_tokens, "max_tokens"))
+    if budget_window is not None:
+        budget_window = budget.validate_window(budget_window)
+    return max_cost_usd, max_tokens, budget_window
+
+
 def provision(name: str, *, max_workers: int | None = None,
               admin: bool | None = None, reset_password: bool = False,
               max_cost_usd: float | None = None, max_tokens: int | None = None,
@@ -68,6 +85,11 @@ def provision(name: str, *, max_workers: int | None = None,
     the caller must show it once and keep no copy.
     """
     name = validate_username(name)
+    # Validated here and not only in `set_limits`: this tool also sets the
+    # limits, and a bad value stored in the record does not break the budget
+    # report, it refuses every subsequent `send_task` for that tenant.
+    max_cost_usd, max_tokens, budget_window = _validate_limits(
+        max_cost_usd, max_tokens, budget_window)
     record_path = config.TENANTS_DIR / f"{name}.json"
 
     if record_path.exists():
@@ -142,6 +164,53 @@ def provision(name: str, *, max_workers: int | None = None,
         "admin": tenant.admin,
         "password": password,
         "has_git_identity": tenant.gitconfig.exists(),
+    }
+
+
+def set_limits(name: str, *, max_cost_usd: float | None = None,
+               max_tokens: int | None = None,
+               budget_window: str | None = None,
+               owner: Owner = None) -> dict:
+    """Change an existing tenant's spend limits. Nothing else.
+
+    Deliberately **not** a call to ``provision``. That would work — it updates
+    limits idempotently — but it also talks to the broker, and a budget change
+    that fails because RabbitMQ is unreachable would be a baffling error to
+    read. This touches one file and reports what the record now says.
+
+    Zero is a meaningful value here (it means *no limit*), so ``None`` is what
+    "leave this alone" has to be, and all three arguments being ``None`` is
+    refused rather than silently doing nothing: a caller that reaches this
+    function has asked to change something.
+    """
+    name = validate_username(name)
+    if max_cost_usd is None and max_tokens is None and budget_window is None:
+        raise ValueError(
+            "nothing to set: pass at least one of max_cost_usd, max_tokens or "
+            "budget_window. Zero is a limit of none, not an omission."
+        )
+    max_cost_usd, max_tokens, budget_window = _validate_limits(
+        max_cost_usd, max_tokens, budget_window)
+
+    record_path = config.TENANTS_DIR / f"{name}.json"
+    if not record_path.exists():
+        raise ValueError(f"no such tenant {name!r}")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    limits = record.setdefault("limits", {})
+    for key, value in (("max_cost_usd", max_cost_usd),
+                       ("max_tokens", max_tokens),
+                       ("budget_window", budget_window)):
+        if value is not None:
+            limits[key] = value
+    _write_private(record_path, json.dumps(record, indent=2) + "\n", owner)
+
+    tenant = load_tenant(name)
+    return {
+        "user": tenant.name,
+        "max_cost_usd": tenant.max_cost_usd,
+        "max_tokens": tenant.max_tokens,
+        "budget_window": tenant.budget_window,
+        "usage": budget.status(tenant),
     }
 
 

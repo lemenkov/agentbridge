@@ -92,6 +92,7 @@ function costText(row) {
 function render() {
   renderQueued = false;
   renderSummary();
+  renderBudget();
   renderTopology();
   renderLanes();
   renderRecent();
@@ -121,6 +122,89 @@ function renderSummary() {
     (pieces.length ? ` (${pieces.join(", ")})` : "") +
     ` · 7d: ${usage.tasks || 0} tasks, ${cost}`;
   target.textContent = summary;
+}
+
+function renderBudget() {
+  const root = document.getElementById("budget");
+  root.textContent = "";
+  const b = state.totals && state.totals.budget;
+  if (!b) {
+    root.appendChild(el("p", "empty", "no budget data"));
+    return;
+  }
+  if (b.error) {
+    // A window the ledger cannot parse. Say so here rather than render zeros:
+    // a budget panel showing "$0 spent" because the query failed would be a
+    // false reassurance, which is worse than an error.
+    root.appendChild(el("p", "budget-error", `window ${b.window}: ${b.error}`));
+    return;
+  }
+
+  const head = el("p", "budget-head");
+  head.appendChild(el("span", "budget-window", `window ${b.window}`));
+  head.appendChild(el(
+    "span",
+    b.enforced ? "badge badge-on" : "badge badge-off",
+    b.enforced ? "enforced" : "not enforced",
+  ));
+  root.appendChild(head);
+
+  root.appendChild(limitRow(
+    "cost", b.cost_usd, b.max_cost_usd, b.cost_usd_remaining,
+    (v) => `$${Number(v).toFixed(4)}`,
+  ));
+  root.appendChild(limitRow(
+    "tokens", b.tokens, b.max_tokens, b.tokens_remaining,
+    (v) => Number(v).toLocaleString(),
+  ));
+
+  if (b.truncated) {
+    root.appendChild(el("p", "budget-note",
+      "The ledger window could not cover the whole period, so these figures " +
+      "are a floor, not a total."));
+  }
+  if (!b.enforced) {
+    root.appendChild(el("p", "budget-note",
+      "Both limits are 0, which means no limit. Spend is measured either way."));
+  } else {
+    root.appendChild(el("p", "budget-note",
+      "A brake, not a cap: the check runs before a task starts, so the last " +
+      "task admitted can carry the total past the line by its own cost."));
+  }
+}
+
+function limitRow(label, spent, limit, remaining, fmt) {
+  const row = el("div", "budget-row");
+  row.appendChild(el("span", "budget-label", label));
+
+  // Drawn as SVG, with the fill's size as a geometry *attribute*, for the
+  // same reason the lanes are: this page is served with `style-src 'self'`
+  // and no unsafe-inline, so nothing here sets an inline style. A width
+  // attribute on a <rect> is not a style, and the lane bars already prove
+  // that path works under this CSP.
+  const used = limit > 0 ? Math.min(1, spent / limit) : 0;
+  const bar = svgEl("svg", {viewBox: "0 0 1000 8", preserveAspectRatio: "none",
+                            class: "budget-bar"});
+  bar.appendChild(svgEl("rect",
+    {x: 0, y: 0, width: 1000, height: 8, rx: 4, class: "budget-track"}));
+  if (limit > 0 && used > 0) {
+    const klass = spent >= limit
+      ? "budget-fill over"
+      : (used >= 0.8 ? "budget-fill near" : "budget-fill");
+    bar.appendChild(svgEl("rect",
+      {x: 0, y: 0, width: Math.max(2, used * 1000), height: 8, rx: 4,
+       class: klass}));
+  }
+  // No limit: nothing to fill, and an empty track says that better than a
+  // full one would.
+  row.appendChild(bar);
+
+  const text = limit > 0
+    ? `${fmt(spent)} of ${fmt(limit)}` +
+      (remaining === undefined ? "" : ` · ${fmt(remaining)} left`)
+    : `${fmt(spent)} · no limit`;
+  row.appendChild(el("span", "budget-figures", text));
+  return row;
 }
 
 function renderTopology() {

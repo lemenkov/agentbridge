@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agentbridge import status
+from agentbridge import ledger, status
 from agentbridge.service import config, fleet, rabbit_mgmt, tap
 from agentbridge.service.tenant import tenant_from_headers
 
@@ -114,6 +114,51 @@ class TenantFleet(unittest.TestCase):
         self.assertEqual(snap["totals"]["usage_7d"]["tasks"], 0)
         # Omitted entirely rather than reported as empty: no API, no answer.
         self.assertNotIn("queues", snap)
+
+    def test_the_snapshot_always_carries_a_budget(self):
+        # Present with no limits set, because "spent X, no limit" is the
+        # useful reading and a panel that appears only once a limit exists is
+        # a panel nobody discovers.
+        with mock.patch.object(config, "RABBITMQ_ADMIN_USER", ""):
+            snap = asyncio.run(fleet.snapshot(self.alice, []))
+        spend = snap["totals"]["budget"]
+        self.assertFalse(spend["enforced"])
+        self.assertEqual(spend["cost_usd"], 0.0)
+        self.assertEqual(spend["window"], "30d")
+
+    def test_the_budget_reports_a_limit_and_what_is_left(self):
+        (config.TENANTS_DIR / "alice.json").write_text(json.dumps({
+            "vhost": "ab-alice", "bus_user": "ab-alice", "bus_password": "p",
+            "limits": {"max_workers": 4, "max_cost_usd": 5.0},
+        }))
+        alice = tenant_from_headers({config.USER_HEADER: "alice"})
+        ledger.append(alice.ledger, {
+            "kind": "task", "rc": 0, "cost_usd": 1.25,
+            "ts_start": ledger.now_iso(), "ts_end": ledger.now_iso(),
+        })
+        with mock.patch.object(config, "RABBITMQ_ADMIN_USER", ""):
+            snap = asyncio.run(fleet.snapshot(alice, []))
+        spend = snap["totals"]["budget"]
+        self.assertTrue(spend["enforced"])
+        self.assertEqual(spend["cost_usd"], 1.25)
+        self.assertEqual(spend["cost_usd_remaining"], 3.75)
+
+    def test_an_unreadable_window_degrades_to_an_error_not_to_zeros(self):
+        # A hand-edited record can hold a window set_budget would refuse. The
+        # page must say so: "$0 spent" because the query failed is a false
+        # reassurance, which is worse than an error.
+        (config.TENANTS_DIR / "alice.json").write_text(json.dumps({
+            "vhost": "ab-alice", "bus_user": "ab-alice", "bus_password": "p",
+            "limits": {"max_workers": 4, "budget_window": "banana"},
+        }))
+        alice = tenant_from_headers({config.USER_HEADER: "alice"})
+        with mock.patch.object(config, "RABBITMQ_ADMIN_USER", ""):
+            snap = asyncio.run(fleet.snapshot(alice, []))
+        spend = snap["totals"]["budget"]
+        self.assertIn("error", spend)
+        self.assertNotIn("cost_usd", spend)
+        # And the rest of the snapshot survived it.
+        self.assertEqual(snap["user"], "alice")
 
     def test_queues_appear_when_the_management_api_is_configured(self):
         rows = [{"name": "r-1.inbox", "ready": 2, "unacked": 1, "consumers": 1}]

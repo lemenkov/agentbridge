@@ -128,6 +128,38 @@ def _fix_htpasswd_ownership(svc: pwd.struct_passwd) -> None:
             os.chmod(path, mode)
 
 
+def cmd_budget(args: argparse.Namespace) -> None:
+    """Change one tenant's spend limits, and print what they have spent.
+
+    The same work as the admin endpoint's `set_budget`, reachable by the root
+    operator without an MCP connector — which is also how it gets gated on a
+    live host.
+    """
+    from . import provisioning
+    from .tenant import TenantError
+
+    svc = _service_user()
+    try:
+        result = provisioning.set_limits(
+            args.user, max_cost_usd=args.max_cost_usd,
+            max_tokens=args.max_tokens, budget_window=args.budget_window,
+            owner=(svc.pw_uid, svc.pw_gid),
+        )
+    except (TenantError, ValueError) as e:
+        sys.exit(str(e))
+    spent = result["usage"]
+    cost_limit = (f"{result['max_cost_usd']:.4f}" if result["max_cost_usd"]
+                  else "none")
+    token_limit = result["max_tokens"] or "none"
+    print(f"{result['user']}: window {result['budget_window']}, "
+          f"{'enforced' if spent['enforced'] else 'not enforced'}")
+    print(f"  cost   ${spent['cost_usd']:.4f} of {cost_limit}")
+    print(f"  tokens {spent['tokens']} of {token_limit}")
+    if spent.get("truncated"):
+        print("  note: the ledger window could not cover the whole period, "
+              "so these are a floor")
+
+
 def cmd_provision(args: argparse.Namespace) -> None:
     from . import config, provisioning
     from .tenant import TenantError
@@ -378,6 +410,19 @@ def main() -> None:
     p.add_argument("--no-admin", action="store_true",
                    help="revoke admin access")
     p.set_defaults(func=cmd_provision)
+
+    p = sub.add_parser("budget",
+                       help="set a tenant's spend limits and show their spend")
+    p.add_argument("user")
+    p.add_argument("--max-cost-usd", type=float, default=None, metavar="USD",
+                   help="0 removes the limit; omit to leave it unchanged")
+    p.add_argument("--max-tokens", type=int, default=None, metavar="N",
+                   help="0 removes the limit; omit to leave it unchanged")
+    p.add_argument("--budget-window", default=None, metavar="SPEC",
+                   help="relative span the limits apply over: 30d, 24h, 90m. "
+                        "A fixed date is refused — its bound would never roll "
+                        "forward.")
+    p.set_defaults(func=cmd_budget)
 
     p = sub.add_parser("list", help="list tenants, credentials and worker counts")
     p.set_defaults(func=cmd_list)

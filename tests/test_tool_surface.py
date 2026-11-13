@@ -32,7 +32,8 @@ USER_TOOLS = {
     "list_git_credentials", "test_git_credential", "fetch_repo",
 }
 
-ADMIN_TOOLS = {"provision_user", "deprovision_user", "list_users"}
+ADMIN_TOOLS = {"provision_user", "set_budget", "deprovision_user",
+               "list_users"}
 
 
 def names(server) -> set[str]:

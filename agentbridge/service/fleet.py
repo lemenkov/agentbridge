@@ -16,7 +16,7 @@ import asyncio
 import logging
 
 from .. import ledger, status
-from . import checks, config, rabbit_mgmt
+from . import budget, checks, config, rabbit_mgmt
 from .tenant import Tenant
 
 log = logging.getLogger("mcp-agentbridge")
@@ -101,6 +101,21 @@ def _usage_7d(tenant: Tenant) -> dict:
     }
 
 
+def _budget(tenant: Tenant) -> dict:
+    """Spend inside the tenant's budget window, degraded rather than fatal.
+
+    A window the ledger cannot parse is a misconfiguration, and `set_budget`
+    refuses to write one — but a record edited by hand can still hold one, and
+    the fleet page is exactly where an operator should be able to *see* that
+    rather than get a blank screen.
+    """
+    try:
+        return budget.status(tenant)
+    except ValueError as exc:
+        log.info("user=%s budget unreadable: %s", tenant.name, exc)
+        return {"window": tenant.budget_window, "error": str(exc)}
+
+
 async def queue_depths(tenant: Tenant) -> list[dict] | None:
     """The tenant's queues, or None when the management API is not configured.
 
@@ -122,9 +137,10 @@ async def snapshot(tenant: Tenant, units: list[dict]) -> dict:
     statuses = await asyncio.to_thread(status.read_dir, tenant.status_dir)
     rows = merge(statuses, units)
     await asyncio.to_thread(sweep, tenant, units)
-    queues, usage = await asyncio.gather(
+    queues, usage, spend = await asyncio.gather(
         queue_depths(tenant),
         asyncio.to_thread(_usage_7d, tenant),
+        asyncio.to_thread(_budget, tenant),
     )
     # Checks share the unit prefix and the worker budget, but they are not
     # workers you can send a task to, so they are reported separately.
@@ -148,6 +164,10 @@ async def snapshot(tenant: Tenant, units: list[dict]) -> dict:
             "budget_used": len([r for r in rows
                                 if r.get("unit_active") in ("active", "activating")]),
             "usage_7d": usage,
+            # Always present, limits or not: "spent X, no limit set" is the
+            # useful reading, and a panel that appears only once a limit
+            # exists is a panel nobody discovers.
+            "budget": spend,
         },
     }
     if queues is not None:
