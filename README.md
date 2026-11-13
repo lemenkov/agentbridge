@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # agentbridge
 
-Multi-agent orchestration bridge connecting AI agents via a message bus.
+Multi-tenant orchestration service for fleets of containerized AI coding agents — MCP front end, RabbitMQ bus, per-tenant isolation and budgets. Alpha.
 
 ## Overview
 

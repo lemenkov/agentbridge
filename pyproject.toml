@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentbridge"
 version = "0.1.0"
-description = "Multi-agent orchestration bridge connecting AI agents via message bus"
+description = "Multi-tenant orchestration service for fleets of containerized AI coding agents — MCP front end, RabbitMQ bus, per-tenant isolation and budgets. Alpha."
 readme = "README.md"
 # 3.11 for tomllib, which backends.py uses to read backends.toml, and which
 # server.py imports unconditionally. Python 3.10 reaches end of security
