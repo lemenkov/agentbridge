@@ -63,6 +63,37 @@ they clone, web pages, other people's issue trackers.
 overwrites if the client supplied one. No tool takes a user name as an
 argument; a tenant cannot name another tenant.
 
+**One tenant cannot read another's messages, and it is the broker that says
+so.** Each tenant gets its own RabbitMQ vhost (`ab-<u>`), its own bus user, and
+permissions on that vhost alone; the bus user carries no broker tag, so it
+cannot log into the management UI and look around. A vhost is a hard namespace:
+exchanges, queues and bindings do not exist across it, so a wildcard binding
+like `*.output` reaches only that tenant's own workers — there is no routing
+key that names another vhost. The `.*` permission inside a vhost is not a
+weakness; the vhost *is* the scope. No code of ours sits between a tenant and
+that boundary, and leaves never hold bus credentials at all: the bridge holds
+the connection host-side, so a prompt-injected agent has nothing to connect
+with.
+
+**What the service is responsible for is the choice of credentials, not the
+boundary.** The vhost is part of the AMQP URL, and every bus operation builds
+its connection from the URL of the tenant the header named. No bus call takes
+a vhost argument, so none can be handed the wrong one — but a bug that picked
+the wrong tenant's URL would be a cross-tenant bug, and no vhost would catch
+it, because the credentials would already be the other tenant's. That is the
+half worth testing, and `tests/test_tenant_isolation.py` tests it.
+
+**What is deliberately *not* separated**, stated here so it is not mistaken
+for a guarantee: every tenant's records, ledgers and status files live under
+one directory owned by the single service user, and worker units are
+name-prefixed inside one `systemd --user` instance. Each record is 0600 and
+each workspace 0700, but the owner is the same account for all of them, so the
+OS does not separate tenants — anything running *as the service user* can read
+every tenant's record, including its bus password. Per-tenant uids would be a
+different design. Nothing a leaf can reach runs as that user: leaves are
+rootless containers with no path to the host filesystem beyond their own
+workspace mount.
+
 **Two endpoints (invariant I-2).** The tools that create and delete tenants
 live on a separate port and nginx location from the tools an orchestrator uses.
 A prompt-injected orchestrator holds no handle to them — its connector does not
